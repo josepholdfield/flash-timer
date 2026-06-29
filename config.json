@@ -19,6 +19,7 @@
   },
   "auto_champions": true,
   "track_team": "enemy",
+  "double_press_seconds": 0.5,
   "reset_all_key": "num 0",
   "quit_key": "esc"
 }

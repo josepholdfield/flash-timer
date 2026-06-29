@@ -29,11 +29,17 @@ Requires Python 3.12+.
 Press a lane key again to restart that timer back to full duration.
 Hold **Tab** to reveal the key-binding hints (hidden otherwise).
 
+> **Double-press to confirm:** a lane only starts when you press its key
+> **twice within 0.5s** (avoids accidental single taps). Tune the window with
+> `double_press_seconds` in `config.json`.
+
 ## Appearance
 
-- A smooth diagonal black gradient sits behind the text — darkest (most
-  readable) at the bottom-left, fading softer toward the top-right.
-- Overall see-through level is set by `opacity` in `config.json`.
+- No title text — just the timers on a smooth diagonal black gradient that is
+  darkest (most readable) at the bottom-left and softer toward the top-right.
+- `opacity` (0–1) sets how see-through the background is. On Windows the
+  background uses a transparent colour key, so even at `opacity: 0` the
+  background is completely clear while the **text stays fully visible**.
 
 ## Colours
 

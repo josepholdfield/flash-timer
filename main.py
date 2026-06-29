@@ -34,13 +34,31 @@ COLOR_GREEN = "#5ce68a"   # > 3:00
 COLOR_YELLOW = "#ffd24a"  # 1:00 - 3:00
 COLOR_ORANGE = "#ff9d3c"  # 0:30 - 1:00
 COLOR_RED = "#ff5d5d"     # < 0:30 / up
-COLOR_TITLE = "#cdd6ff"
+COLOR_EXPIRED_DIM = "#7a2a2a"  # dim red used for the blink when expired
 COLOR_HINT = "#aab2c6"
+
+# Fully-transparent colour key (Windows): kept very dark so any anti-aliased
+# halo around the text stays a subtle dark outline rather than a coloured fringe.
+CHROMA = "#010101"
 
 # Diagonal gradient endpoints: harshest (darkest) at the bottom-left corner,
 # softest (lighter) toward the top-right.
 GRAD_BOTTOM_LEFT = (6, 7, 12)
 GRAD_TOP_RIGHT = (34, 37, 50)
+
+# 8x8 ordered-dither matrix, normalised to thresholds in (0, 1). Used to fake
+# partial background transparency against the transparent colour key.
+_BAYER8_RAW = [
+    [0, 48, 12, 60, 3, 51, 15, 63],
+    [32, 16, 44, 28, 35, 19, 47, 31],
+    [8, 56, 4, 52, 11, 59, 7, 55],
+    [40, 24, 36, 20, 43, 27, 39, 23],
+    [2, 50, 14, 62, 1, 49, 13, 61],
+    [34, 18, 46, 30, 33, 17, 45, 29],
+    [10, 58, 6, 54, 9, 57, 5, 53],
+    [42, 26, 38, 22, 41, 25, 37, 21],
+]
+_BAYER8 = [[(v + 0.5) / 64 for v in row] for row in _BAYER8_RAW]
 
 DEFAULT_CONFIG = {
     "flash_seconds": 300,
@@ -63,6 +81,7 @@ DEFAULT_CONFIG = {
     },
     "auto_champions": True,
     "track_team": "enemy",
+    "double_press_seconds": 0.5,
     "reset_all_key": "num 0",
     "quit_key": "esc",
 }
@@ -125,7 +144,6 @@ class FlashOverlay:
     PAD_X = 16
     PAD_TOP = 12
     PAD_BOTTOM = 12
-    TITLE_GAP = 8
     ROW_SPACING = 6
     HINT_GAP = 8
 
@@ -151,21 +169,34 @@ class FlashOverlay:
             lane: FlashTimer(self.duration) for lane in self.bindings.values()
         }
 
+        # Require two presses within this window to confirm a Flash was cast.
+        self.double_press_window = float(config.get("double_press_seconds", 0.5))
+        self._last_press: dict[str, float] = {}
+
         self._tab_held = False  # show key hints only while Tab is held
         self._win_w = 0
         self._win_h = 0
         self._grad_img: tk.PhotoImage | None = None
+        self.opacity = float(config["opacity"])
+        self._use_chroma = False
 
         self.root = tk.Tk()
-        self.root.title("Flash Timers")
-        self.root.configure(bg="#06070c")
+        self.root.title("")
+        self.root.configure(bg=CHROMA)
         self.root.attributes("-topmost", bool(config["always_on_top"]))
-        try:
-            # Uniform window transparency so the game shows through the overlay.
-            self.root.attributes("-alpha", float(config["opacity"]))
-        except tk.TclError:
-            pass
         self.root.overrideredirect(True)  # borderless floating overlay
+        try:
+            # Windows: render the CHROMA colour fully see-through. This clears
+            # the background independently of the (always opaque) text, so the
+            # timers stay readable even at opacity 0.
+            self.root.attributes("-transparentcolor", CHROMA)
+            self._use_chroma = True
+        except tk.TclError:
+            # Other platforms: fall back to uniform window transparency.
+            try:
+                self.root.attributes("-alpha", max(0.2, self.opacity))
+            except tk.TclError:
+                pass
 
         self._build_ui()
         self._place_window()
@@ -179,20 +210,15 @@ class FlashOverlay:
 
     def _build_ui(self) -> None:
         """Create the canvas, fonts and text items, then size everything."""
-        self.title_font = tkfont.Font(family="Consolas", size=12, weight="bold")
         self.row_font = tkfont.Font(family="Consolas", size=18, weight="bold")
         self.hint_font = tkfont.Font(family="Consolas", size=9)
 
-        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0, bg=CHROMA)
         self.canvas.pack(fill="both", expand=True)
 
         # Background gradient sits behind everything.
         self.bg_item = self.canvas.create_image(0, 0, anchor="nw")
 
-        self.title_item = self.canvas.create_text(
-            0, 0, anchor="nw", text="⚡ Flash Timers",
-            font=self.title_font, fill=COLOR_TITLE,
-        )
         self.row_items: dict[str, int] = {
             lane: self.canvas.create_text(
                 0, 0, anchor="nw", text="", font=self.row_font, fill=COLOR_IDLE
@@ -221,10 +247,8 @@ class FlashOverlay:
         for lane in self.timers:
             self.canvas.itemconfig(self.row_items[lane], text=self._row_text(lane, "0:00"))
 
-        # Width: the widest of title, any row, and the hint.
-        widths = [self.title_font.measure("⚡ Flash Timers"), self.hint_font.measure(
-            self.canvas.itemcget(self.hint_item, "text")
-        )]
+        # Width: the widest of any row and the hint.
+        widths = [self.hint_font.measure(self.canvas.itemcget(self.hint_item, "text"))]
         widths += [
             self.row_font.measure(self.canvas.itemcget(self.row_items[lane], "text"))
             for lane in self.timers
@@ -232,13 +256,10 @@ class FlashOverlay:
         width = max(widths) + 2 * self.PAD_X
 
         # Vertical stacking.
-        title_h = self.title_font.metrics("linespace")
         row_h = self.row_font.metrics("linespace")
         hint_h = self.hint_font.metrics("linespace")
 
         y = self.PAD_TOP
-        self.canvas.coords(self.title_item, self.PAD_X, y)
-        y += title_h + self.TITLE_GAP
         for lane in self.timers:
             self.canvas.coords(self.row_items[lane], self.PAD_X, y)
             y += row_h + self.ROW_SPACING
@@ -256,7 +277,13 @@ class FlashOverlay:
         self._draw_gradient(width, height)
 
     def _draw_gradient(self, w: int, h: int) -> None:
-        """Render a smooth diagonal black gradient (dark bottom-left)."""
+        """Render the diagonal black gradient (darkest at the bottom-left).
+
+        When a transparent colour key is available, `opacity` controls how much
+        of the gradient is drawn via an ordered (Bayer) dither: at 0 every pixel
+        is the clear key (fully see-through), at 1 it is solid. The text, drawn
+        on top, always stays fully opaque.
+        """
         bl, tr = GRAD_BOTTOM_LEFT, GRAD_TOP_RIGHT
         total = (w - 1) + (h - 1) or 1
         # Pre-compute one colour per diagonal step (cheap: w+h, not w*h).
@@ -268,10 +295,16 @@ class FlashOverlay:
             b = int(bl[2] + (tr[2] - bl[2]) * t)
             lut.append(f"#{r:02x}{g:02x}{b:02x}")
 
+        op = self.opacity if self._use_chroma else 1.0
         img = tk.PhotoImage(width=w, height=h)
         for y in range(h):
             base = h - 1 - y  # 0 at bottom row -> darkest on the left
-            img.put("{" + " ".join(lut[x + base] for x in range(w)) + "}", to=(0, y))
+            thresholds = _BAYER8[y & 7]
+            row = [
+                lut[x + base] if op > thresholds[x & 7] else CHROMA  # CHROMA = hole
+                for x in range(w)
+            ]
+            img.put("{" + " ".join(row) + "}", to=(0, y))
 
         self._grad_img = img  # keep a reference so it isn't garbage-collected
         self.canvas.itemconfig(self.bg_item, image=img)
@@ -333,7 +366,17 @@ class FlashOverlay:
         self.root.after(120, self._poll_hint)
 
     def _start_lane(self, lane: str) -> None:
-        self.timers[lane].start()
+        """Start a lane only on a confirming double-press within the window.
+
+        The first press is remembered; a second press of the same key within
+        `double_press_window` seconds starts (or restarts) that lane's timer.
+        """
+        now = time.monotonic()
+        if now - self._last_press.get(lane, 0.0) <= self.double_press_window:
+            self.timers[lane].start()
+            self._last_press[lane] = 0.0  # reset so the next cast needs two presses
+        else:
+            self._last_press[lane] = now
 
     def _reset_all(self) -> None:
         for timer in self.timers.values():
@@ -366,20 +409,16 @@ class FlashOverlay:
     def _tick(self) -> None:
         """Refresh every label once per second (keeps CPU near idle)."""
         self._refresh_auto_labels()
-        flash = False
+        on = int(time.monotonic()) % 2 == 0  # blink phase for expired timers
         for lane, timer in self.timers.items():
             value = self._format(timer.remaining, timer.running)
-            color = self._color_for(timer.remaining, timer.running)
+            if timer.running and timer.remaining <= 0:
+                color = COLOR_RED if on else COLOR_EXPIRED_DIM  # blink when up
+            else:
+                color = self._color_for(timer.remaining, timer.running)
             self.canvas.itemconfig(
                 self.row_items[lane], text=self._row_text(lane, value), fill=color
             )
-            if timer.running and timer.remaining <= 0:
-                flash = True
-
-        # Subtle flash of the title when any Flash is back up.
-        on = int(time.monotonic()) % 2 == 0
-        title_color = COLOR_RED if (flash and on) else COLOR_TITLE
-        self.canvas.itemconfig(self.title_item, fill=title_color)
 
         self.root.after(1000, self._tick)
 
