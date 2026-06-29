@@ -1,8 +1,7 @@
 {
   "flash_seconds": 300,
   "always_on_top": true,
-  "opacity": 1.0,
-  "transparent": true,
+  "opacity": 0.85,
   "corner": "bottom-left",
   "bindings": {
     "num 7": "Top",

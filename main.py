@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 
 try:
     import keyboard  # global hotkeys (Windows-friendly)
@@ -26,15 +27,25 @@ from league import ChampionWatcher
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-# Chroma-key colour used to make the window background fully see-through on
-# Windows (must be a colour no text uses).
-CHROMA = "#ff00ff"
+# Readable, high-contrast countdown palette (kept bright so it pops on the
+# dark gradient behind it).
+COLOR_IDLE = "#aeb4c4"    # no timer running
+COLOR_GREEN = "#5ce68a"   # > 3:00
+COLOR_YELLOW = "#ffd24a"  # 1:00 - 3:00
+COLOR_ORANGE = "#ff9d3c"  # 0:30 - 1:00
+COLOR_RED = "#ff5d5d"     # < 0:30 / up
+COLOR_TITLE = "#cdd6ff"
+COLOR_HINT = "#aab2c6"
+
+# Diagonal gradient endpoints: harshest (darkest) at the bottom-left corner,
+# softest (lighter) toward the top-right.
+GRAD_BOTTOM_LEFT = (6, 7, 12)
+GRAD_TOP_RIGHT = (34, 37, 50)
 
 DEFAULT_CONFIG = {
     "flash_seconds": 300,
     "always_on_top": True,
-    "opacity": 1.0,
-    "transparent": True,
+    "opacity": 0.85,
     "corner": "bottom-left",
     "bindings": {
         "num 7": "Top",
@@ -108,7 +119,15 @@ class FlashTimer:
 
 
 class FlashOverlay:
-    """Tkinter overlay that renders all lane Flash timers."""
+    """Tkinter overlay that renders all lane Flash timers on a gradient canvas."""
+
+    # Layout metrics (pixels).
+    PAD_X = 16
+    PAD_TOP = 12
+    PAD_BOTTOM = 12
+    TITLE_GAP = 8
+    ROW_SPACING = 6
+    HINT_GAP = 8
 
     def __init__(self, config: dict) -> None:
         self.config = config
@@ -132,76 +151,134 @@ class FlashOverlay:
             lane: FlashTimer(self.duration) for lane in self.bindings.values()
         }
 
-        # Background: chroma colour (see-through) when transparent, else dark.
-        self.bg = CHROMA if config.get("transparent", True) else "#101015"
+        self._tab_held = False  # show key hints only while Tab is held
+        self._win_w = 0
+        self._win_h = 0
+        self._grad_img: tk.PhotoImage | None = None
 
         self.root = tk.Tk()
         self.root.title("Flash Timers")
-        self.root.configure(bg=self.bg)
+        self.root.configure(bg="#06070c")
         self.root.attributes("-topmost", bool(config["always_on_top"]))
         try:
+            # Uniform window transparency so the game shows through the overlay.
             self.root.attributes("-alpha", float(config["opacity"]))
         except tk.TclError:
             pass
-        if config.get("transparent", True):
-            try:
-                # Windows-only: makes every CHROMA-coloured pixel fully clear.
-                self.root.attributes("-transparentcolor", CHROMA)
-            except tk.TclError:
-                self.bg = "#101015"
-                self.root.configure(bg=self.bg)
         self.root.overrideredirect(True)  # borderless floating overlay
 
-        self._build_rows()
-        self._make_draggable()
+        self._build_ui()
         self._place_window()
         self._register_hotkeys()
+        self._watch_tab()
 
         # Quit on Escape from the window too.
         self.root.bind("<Escape>", lambda _e: self.quit())
 
-    def _build_rows(self) -> None:
-        """Create one label row per lane plus a draggable title bar."""
-        self.title_bar = tk.Label(
-            self.root,
-            text="⚡ Flash Timers",
-            font=("Consolas", 12, "bold"),
-            fg="#9fb4ff",
-            bg=self.bg,
-            anchor="w",
-            padx=10,
+    # ----- UI construction -------------------------------------------------
+
+    def _build_ui(self) -> None:
+        """Create the canvas, fonts and text items, then size everything."""
+        self.title_font = tkfont.Font(family="Consolas", size=12, weight="bold")
+        self.row_font = tkfont.Font(family="Consolas", size=18, weight="bold")
+        self.hint_font = tkfont.Font(family="Consolas", size=9)
+
+        self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        # Background gradient sits behind everything.
+        self.bg_item = self.canvas.create_image(0, 0, anchor="nw")
+
+        self.title_item = self.canvas.create_text(
+            0, 0, anchor="nw", text="⚡ Flash Timers",
+            font=self.title_font, fill=COLOR_TITLE,
         )
-        self.title_bar.pack(fill="x", pady=(6, 2))
-
-        # Widest label so columns line up regardless of champion name length.
-        self._label_width = max(8, *(len(name) for name in self.labels.values()))
-
-        self.row_labels: dict[str, tk.Label] = {}
-        for lane in self.timers:
-            label = tk.Label(
-                self.root,
-                text=f"{self.labels[lane]:<{self._label_width}}  -",
-                font=("Consolas", 18, "bold"),
-                fg="#666a75",
-                bg=self.bg,
-                anchor="w",
-                padx=12,
+        self.row_items: dict[str, int] = {
+            lane: self.canvas.create_text(
+                0, 0, anchor="nw", text="", font=self.row_font, fill=COLOR_IDLE
             )
-            label.pack(fill="x")
-            self.row_labels[lane] = label
-
-        self.hint = tk.Label(
-            self.root,
-            text="  ".join(f"{k.replace('num ', 'Num')}:{v}" for k, v in self.bindings.items()),
-            font=("Consolas", 8),
-            fg="#4a4d57",
-            bg=self.bg,
-            padx=10,
+            for lane in self.timers
+        }
+        hint_text = "  ".join(
+            f"{k.replace('num ', 'Num')}:{v}" for k, v in self.bindings.items()
         )
-        self.hint.pack(fill="x", pady=(2, 6))
+        self.hint_item = self.canvas.create_text(
+            0, 0, anchor="nw", text=hint_text, font=self.hint_font,
+            fill=COLOR_HINT, state="hidden",
+        )
+
+        self._make_draggable()
+        self._relayout()
+
+    def _row_text(self, lane: str, value: str) -> str:
+        """Pad the label so the countdown column lines up across rows."""
+        width = max(8, *(len(name) for name in self.labels.values()))
+        return f"{self.labels[lane]:<{width}}  {value}"
+
+    def _relayout(self) -> None:
+        """Recompute size/positions and rebuild the gradient (champion changes)."""
+        # Set current row texts so width measurement reflects real content.
+        for lane in self.timers:
+            self.canvas.itemconfig(self.row_items[lane], text=self._row_text(lane, "0:00"))
+
+        # Width: the widest of title, any row, and the hint.
+        widths = [self.title_font.measure("⚡ Flash Timers"), self.hint_font.measure(
+            self.canvas.itemcget(self.hint_item, "text")
+        )]
+        widths += [
+            self.row_font.measure(self.canvas.itemcget(self.row_items[lane], "text"))
+            for lane in self.timers
+        ]
+        width = max(widths) + 2 * self.PAD_X
+
+        # Vertical stacking.
+        title_h = self.title_font.metrics("linespace")
+        row_h = self.row_font.metrics("linespace")
+        hint_h = self.hint_font.metrics("linespace")
+
+        y = self.PAD_TOP
+        self.canvas.coords(self.title_item, self.PAD_X, y)
+        y += title_h + self.TITLE_GAP
+        for lane in self.timers:
+            self.canvas.coords(self.row_items[lane], self.PAD_X, y)
+            y += row_h + self.ROW_SPACING
+        # Reserve hint space even when hidden so toggling never resizes/jumps.
+        y += self.HINT_GAP - self.ROW_SPACING
+        self.canvas.coords(self.hint_item, self.PAD_X, y)
+        y += hint_h
+        height = y + self.PAD_BOTTOM
+
+        self._win_w, self._win_h = width, height
+        self.canvas.config(width=width, height=height)
+        x = self.root.winfo_x()
+        wy = self.root.winfo_y()
+        self.root.geometry(f"{width}x{height}+{x}+{wy}")
+        self._draw_gradient(width, height)
+
+    def _draw_gradient(self, w: int, h: int) -> None:
+        """Render a smooth diagonal black gradient (dark bottom-left)."""
+        bl, tr = GRAD_BOTTOM_LEFT, GRAD_TOP_RIGHT
+        total = (w - 1) + (h - 1) or 1
+        # Pre-compute one colour per diagonal step (cheap: w+h, not w*h).
+        lut = []
+        for s in range(total + 1):
+            t = s / total
+            r = int(bl[0] + (tr[0] - bl[0]) * t)
+            g = int(bl[1] + (tr[1] - bl[1]) * t)
+            b = int(bl[2] + (tr[2] - bl[2]) * t)
+            lut.append(f"#{r:02x}{g:02x}{b:02x}")
+
+        img = tk.PhotoImage(width=w, height=h)
+        for y in range(h):
+            base = h - 1 - y  # 0 at bottom row -> darkest on the left
+            img.put("{" + " ".join(lut[x + base] for x in range(w)) + "}", to=(0, y))
+
+        self._grad_img = img  # keep a reference so it isn't garbage-collected
+        self.canvas.itemconfig(self.bg_item, image=img)
+        self.canvas.tag_lower(self.bg_item)  # keep behind the text
 
     def _make_draggable(self) -> None:
-        """Allow dragging the borderless window by its title bar."""
+        """Drag the borderless overlay from anywhere on the canvas."""
         self._drag = {"x": 0, "y": 0}
 
         def start(event: tk.Event) -> None:
@@ -213,8 +290,8 @@ class FlashOverlay:
             y = self.root.winfo_y() + event.y - self._drag["y"]
             self.root.geometry(f"+{x}+{y}")
 
-        self.title_bar.bind("<Button-1>", start)
-        self.title_bar.bind("<B1-Motion>", move)
+        self.canvas.bind("<Button-1>", start)
+        self.canvas.bind("<B1-Motion>", move)
 
     def _place_window(self) -> None:
         """Restore saved position, or anchor to the configured screen corner."""
@@ -227,13 +304,13 @@ class FlashOverlay:
         margin = 12
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        win_w = self.root.winfo_reqwidth()
-        win_h = self.root.winfo_reqheight()
         corner = self.config.get("corner", "bottom-left")
-        x = margin if "left" in corner else screen_w - win_w - margin
+        x = margin if "left" in corner else screen_w - self._win_w - margin
         # Leave room above the Windows taskbar for bottom corners.
-        y = margin if "top" in corner else screen_h - win_h - 48
+        y = margin if "top" in corner else screen_h - self._win_h - 48
         self.root.geometry(f"+{x}+{y}")
+
+    # ----- Input -----------------------------------------------------------
 
     def _register_hotkeys(self) -> None:
         """Bind global hotkeys to start/reset timers."""
@@ -242,6 +319,19 @@ class FlashOverlay:
         keyboard.add_hotkey(self.config["reset_all_key"], self._reset_all)
         keyboard.add_hotkey(self.config["quit_key"], self.quit)
 
+    def _watch_tab(self) -> None:
+        """Track Tab held state globally and poll it to toggle the hint."""
+        keyboard.on_press_key("tab", lambda _e: setattr(self, "_tab_held", True))
+        keyboard.on_release_key("tab", lambda _e: setattr(self, "_tab_held", False))
+        self._poll_hint()
+
+    def _poll_hint(self) -> None:
+        """Show the key-binding hint only while Tab is held (low CPU poll)."""
+        state = "normal" if self._tab_held else "hidden"
+        if self.canvas.itemcget(self.hint_item, "state") != state:
+            self.canvas.itemconfig(self.hint_item, state=state)
+        self.root.after(120, self._poll_hint)
+
     def _start_lane(self, lane: str) -> None:
         self.timers[lane].start()
 
@@ -249,20 +339,20 @@ class FlashOverlay:
         for timer in self.timers.values():
             timer.clear()
 
+    # ----- Rendering -------------------------------------------------------
+
     @staticmethod
     def _color_for(remaining: float, running: bool) -> str:
         """Color-code the countdown by urgency."""
         if not running:
-            return "#666a75"  # idle grey
-        if remaining <= 0:
-            return "#ff3b3b"  # ready / flashing red
-        if remaining < 30:
-            return "#ff3b3b"  # red
+            return COLOR_IDLE
+        if remaining <= 0 or remaining < 30:
+            return COLOR_RED
         if remaining < 60:
-            return "#ff9f1c"  # orange
+            return COLOR_ORANGE
         if remaining < 180:
-            return "#ffd23f"  # yellow
-        return "#3ad07a"  # green
+            return COLOR_YELLOW
+        return COLOR_GREEN
 
     @staticmethod
     def _format(remaining: float, running: bool) -> str:
@@ -278,21 +368,18 @@ class FlashOverlay:
         self._refresh_auto_labels()
         flash = False
         for lane, timer in self.timers.items():
-            text = self._format(timer.remaining, timer.running)
+            value = self._format(timer.remaining, timer.running)
             color = self._color_for(timer.remaining, timer.running)
-            label = self.labels[lane]
-            self.row_labels[lane].config(
-                text=f"{label:<{self._label_width}}  {text}", fg=color
+            self.canvas.itemconfig(
+                self.row_items[lane], text=self._row_text(lane, value), fill=color
             )
             if timer.running and timer.remaining <= 0:
                 flash = True
 
-        # Subtle flash of the title bar when any Flash is back up.
-        if flash:
-            on = int(time.monotonic()) % 2 == 0
-            self.title_bar.config(fg="#ff3b3b" if on else "#9fb4ff")
-        else:
-            self.title_bar.config(fg="#9fb4ff")
+        # Subtle flash of the title when any Flash is back up.
+        on = int(time.monotonic()) % 2 == 0
+        title_color = COLOR_RED if (flash and on) else COLOR_TITLE
+        self.canvas.itemconfig(self.title_item, fill=title_color)
 
         self.root.after(1000, self._tick)
 
@@ -310,8 +397,7 @@ class FlashOverlay:
                 self.labels[lane] = champion
                 changed = True
         if changed:
-            # Re-align columns to the longest current name.
-            self._label_width = max(8, *(len(name) for name in self.labels.values()))
+            self._relayout()  # names changed width, so re-size and re-align
 
     def quit(self) -> None:
         """Save window position and close."""
@@ -322,7 +408,7 @@ class FlashOverlay:
             pass
         if self.watcher is not None:
             self.watcher.stop()
-        keyboard.clear_all_hotkeys()
+        keyboard.unhook_all()
         self.root.destroy()
 
     def run(self) -> None:
