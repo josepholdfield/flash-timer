@@ -1,14 +1,25 @@
 {
   "flash_seconds": 300,
   "always_on_top": true,
-  "opacity": 0.85,
+  "opacity": 1.0,
+  "transparent": true,
+  "corner": "bottom-left",
   "bindings": {
-    "num 1": "Top",
-    "num 2": "Jungle",
-    "num 3": "Mid",
-    "num 6": "Bot",
+    "num 7": "Top",
+    "num 8": "Jungle",
+    "num 9": "Mid",
+    "num 4": "Bot",
     "num 5": "Support"
   },
+  "champions": {
+    "Top": "",
+    "Jungle": "",
+    "Mid": "",
+    "Bot": "",
+    "Support": ""
+  },
+  "auto_champions": true,
+  "track_team": "enemy",
   "reset_all_key": "num 0",
   "quit_key": "esc"
 }
