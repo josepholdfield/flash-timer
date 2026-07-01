@@ -48,12 +48,12 @@ COLOR_ICON_HOVER = "#e9edf5"
 COLOR_ICON_BG = "#161a22"     # subtle circular hit area
 COLOR_ICON_BG_HOVER = "#2a3140"
 
-# Interaction plates behind names/reset icons (kept subtle) and the full-window
-# drag surface shown while Tab is held. These are painted (non-chroma) so the
-# areas receive mouse events even when the background is fully transparent.
-COLOR_PLATE = "#12151d"
-COLOR_PLATE_HOVER = "#232a38"
-COLOR_DRAG_BG = "#0b0e14"
+# Invisible click-catching fill. On Windows the CHROMA colour is rendered fully
+# transparent *and click-through*, so genuinely transparent pixels can't receive
+# clicks. A colour one level off the key stays opaque (clicks land instead of
+# passing through to the game) while being visually indistinguishable from the
+# transparent background. Used for the name/reset hitboxes and the drag surface.
+COLOR_GHOST = "#010102"
 
 # Settings panel palette (kept in keeping with the overlay's dark styling).
 COLOR_PANEL_BG = "#12141b"
@@ -275,6 +275,11 @@ class FlashOverlay:
             except tk.TclError:
                 pass
 
+        # Fill used for invisible click-catching zones. Only needed with the
+        # colour-key (Windows), where transparent pixels are click-through; with
+        # -alpha every pixel already receives clicks, so no fill is required.
+        self._ghost = COLOR_GHOST if self._use_chroma else ""
+
         self._build_ui()
         self._place_window()
         self._register_hotkeys()
@@ -322,26 +327,26 @@ class FlashOverlay:
         self.bg_item = self.canvas.create_image(0, 0, anchor="nw")
 
         # Full-window drag surface: shown only while Tab is held so the whole
-        # overlay becomes clickable/draggable (transparent pixels are otherwise
-        # click-through on Windows).
+        # overlay becomes clickable/draggable anywhere. Uses the invisible ghost
+        # fill so the app still looks fully transparent while Tab is held.
         self.tab_bg_item = self.canvas.create_rectangle(
-            0, 0, 0, 0, fill=COLOR_DRAG_BG, outline="", state="hidden",
+            0, 0, 0, 0, fill=self._ghost, outline="", state="hidden",
         )
 
         # Each lane row: a champion name (start), a countdown value, and a reset
-        # icon. Each name/reset has a solid (but subtle) "plate" behind it so the
-        # whole area is clickable/hoverable even at opacity 0, where empty pixels
-        # are click-through on Windows.
+        # icon. Each name/reset has an invisible "ghost" plate behind it so the
+        # whole area is clickable even at opacity 0 (empty pixels are otherwise
+        # click-through on Windows) without showing any visible background.
         self.name_items: dict[str, int] = {}
         self.time_items: dict[str, int] = {}
         self.name_plates: dict[str, int] = {}
         self.reset_plates: dict[str, int] = {}
         for lane in self.timers:
             name_plate = self.canvas.create_rectangle(
-                0, 0, 0, 0, fill=COLOR_PLATE, outline="",
+                0, 0, 0, 0, fill=self._ghost, outline="",
             )
             reset_plate = self.canvas.create_rectangle(
-                0, 0, 0, 0, fill=COLOR_PLATE, outline="",
+                0, 0, 0, 0, fill=self._ghost, outline="",
             )
             name_id = self.canvas.create_text(
                 0, 0, anchor="w", text=self.labels[lane],
@@ -626,11 +631,9 @@ class FlashOverlay:
             kind, role = self._hover
             if kind == "name":
                 self.canvas.itemconfig(self.name_items[role], fill=COLOR_NAME)
-                self.canvas.itemconfig(self.name_plates[role], fill=COLOR_PLATE)
             elif kind == "reset":
                 _tag, fg_tag = self._reset_tags(role)
                 self.canvas.itemconfig(fg_tag, fill=COLOR_NAME, outline=COLOR_NAME)
-                self.canvas.itemconfig(self.reset_plates[role], fill=COLOR_PLATE)
         self._hover = hit
         # Apply the new hover.
         if hit is None:
@@ -639,11 +642,9 @@ class FlashOverlay:
         kind, role = hit
         if kind == "name":
             self.canvas.itemconfig(self.name_items[role], fill=COLOR_NAME_HOVER)
-            self.canvas.itemconfig(self.name_plates[role], fill=COLOR_PLATE_HOVER)
         elif kind == "reset":
             _tag, fg_tag = self._reset_tags(role)
             self.canvas.itemconfig(fg_tag, fill=COLOR_NAME_HOVER, outline=COLOR_NAME_HOVER)
-            self.canvas.itemconfig(self.reset_plates[role], fill=COLOR_PLATE_HOVER)
         self.canvas.configure(cursor="hand2")
 
     def _relayout(self) -> None:
