@@ -10,6 +10,7 @@ Hotkeys (configurable in config.json) work globally while you're in game.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -36,6 +37,15 @@ COLOR_ORANGE = "#ff9d3c"  # 0:30 - 1:00
 COLOR_RED = "#ff5d5d"     # < 0:30 / up
 COLOR_EXPIRED_DIM = "#7a2a2a"  # dim red used for the blink when expired
 COLOR_HINT = "#aab2c6"
+
+# Champion-name and reset-icon interaction colours.
+COLOR_NAME = "#c4cad6"        # champion name at rest
+COLOR_NAME_HOVER = "#ffffff"  # "sharpened" (brightened) on hover
+COLOR_START_FLASH = "#8dffb2" # brief confirm flash when a timer is started
+COLOR_ICON = "#8b93a7"        # reset icon stroke
+COLOR_ICON_HOVER = "#e9edf5"
+COLOR_ICON_BG = "#161a22"     # subtle circular hit area
+COLOR_ICON_BG_HOVER = "#2a3140"
 
 # Fully-transparent colour key (Windows): kept very dark so any anti-aliased
 # halo around the text stays a subtle dark outline rather than a coloured fringe.
@@ -146,6 +156,9 @@ class FlashOverlay:
     PAD_BOTTOM = 12
     ROW_SPACING = 6
     HINT_GAP = 8
+    GAP_NAME_TIME = 18  # space between the name column and the countdown
+    GAP_TIME_ICON = 16  # space between the countdown and the reset icon
+    ICON_R = 10         # reset icon (circular hit area) radius
 
     def __init__(self, config: dict) -> None:
         self.config = config
@@ -174,6 +187,7 @@ class FlashOverlay:
         self._last_press: dict[str, float] = {}
 
         self._tab_held = False  # show key hints only while Tab is held
+        self._hover_lane: str | None = None  # lane whose name is hovered
         self._win_w = 0
         self._win_h = 0
         self._grad_img: tk.PhotoImage | None = None
@@ -219,12 +233,25 @@ class FlashOverlay:
         # Background gradient sits behind everything.
         self.bg_item = self.canvas.create_image(0, 0, anchor="nw")
 
-        self.row_items: dict[str, int] = {
-            lane: self.canvas.create_text(
-                0, 0, anchor="nw", text="", font=self.row_font, fill=COLOR_IDLE
+        # Each lane row: a clickable champion name (start), a countdown value,
+        # and a reset icon (drawn per-row later in _relayout).
+        self.name_items: dict[str, int] = {}
+        self.time_items: dict[str, int] = {}
+        for lane in self.timers:
+            name_id = self.canvas.create_text(
+                0, 0, anchor="w", text=self.labels[lane],
+                font=self.row_font, fill=COLOR_NAME,
             )
-            for lane in self.timers
-        }
+            time_id = self.canvas.create_text(
+                0, 0, anchor="w", text="-", font=self.row_font, fill=COLOR_IDLE
+            )
+            self.name_items[lane] = name_id
+            self.time_items[lane] = time_id
+            # Click the name to start the timer; hovering "sharpens" it.
+            self.canvas.tag_bind(name_id, "<Button-1>", lambda _e, l=lane: self._on_name_click(l))
+            self.canvas.tag_bind(name_id, "<Enter>", lambda _e, l=lane: self._on_name_enter(l))
+            self.canvas.tag_bind(name_id, "<Leave>", lambda _e, l=lane: self._on_name_leave(l))
+
         hint_text = "  ".join(
             f"{k.replace('num ', 'Num')}:{v}" for k, v in self.bindings.items()
         )
@@ -236,33 +263,133 @@ class FlashOverlay:
         self._make_draggable()
         self._relayout()
 
-    def _row_text(self, lane: str, value: str) -> str:
-        """Pad the label so the countdown column lines up across rows."""
-        width = max(8, *(len(name) for name in self.labels.values()))
-        return f"{self.labels[lane]:<{width}}  {value}"
+    def _draw_reset_icon(self, cx: float, cy: float, lane: str) -> None:
+        """Draw a small, easy-to-click restart icon (circular arrow) for a lane."""
+        tag, bg_tag, fg_tag = self._reset_tags(lane)
+        r = self.ICON_R
+
+        # Subtle filled circle acts as the (generous) click target.
+        self.canvas.create_oval(
+            cx - r, cy - r, cx + r, cy + r,
+            fill=COLOR_ICON_BG, outline="", tags=(tag, bg_tag),
+        )
+        # Circular arrow ring with a gap where the arrowhead goes.
+        rr = r - 4
+        self.canvas.create_arc(
+            cx - rr, cy - rr, cx + rr, cy + rr,
+            start=60, extent=270, style="arc",
+            outline=COLOR_ICON, width=2, tags=(tag, fg_tag),
+        )
+        # Arrowhead at the open end of the ring (makes it read as "restart").
+        end = math.radians(60 + 270)
+        tx = cx + rr * math.cos(end)
+        ty = cy - rr * math.sin(end)
+        dirx, diry = -math.sin(end), -math.cos(end)  # CCW tangent (screen coords)
+        perpx, perpy = -diry, dirx
+        ah = 4.0
+        self.canvas.create_polygon(
+            tx + dirx * ah, ty + diry * ah,
+            tx + perpx * ah, ty + perpy * ah,
+            tx - perpx * ah, ty - perpy * ah,
+            fill=COLOR_ICON, outline="", tags=(tag, fg_tag),
+        )
+
+        self.canvas.tag_bind(tag, "<Button-1>", lambda _e, l=lane: self._on_reset_click(l))
+        self.canvas.tag_bind(tag, "<Enter>", lambda _e, l=lane: self._on_icon_enter(l))
+        self.canvas.tag_bind(tag, "<Leave>", lambda _e, l=lane: self._on_icon_leave(l))
+
+    def _render_row(self, lane: str, blink_on: bool = True) -> None:
+        """Update one lane's countdown text and colour."""
+        timer = self.timers[lane]
+        value = self._format(timer.remaining, timer.running)
+        if timer.running and timer.remaining <= 0:
+            color = COLOR_RED if blink_on else COLOR_EXPIRED_DIM  # blink when up
+        else:
+            color = self._color_for(timer.remaining, timer.running)
+        self.canvas.itemconfig(self.time_items[lane], text=value, fill=color)
+
+    # ----- Mouse interaction ----------------------------------------------
+
+    @staticmethod
+    def _reset_tags(lane: str) -> tuple[str, str, str]:
+        """Canvas tag names for a lane's reset icon (space-safe)."""
+        safe = lane.replace(" ", "_")
+        return f"reset-{safe}", f"reset-bg-{safe}", f"reset-fg-{safe}"
+
+    def _on_name_click(self, lane: str) -> None:
+        """Start (or restart) a lane's timer and flash the name as feedback."""
+        self.timers[lane].start()
+        self._render_row(lane)
+        self.canvas.itemconfig(self.name_items[lane], fill=COLOR_START_FLASH)
+        self.root.after(200, lambda l=lane: self._end_name_flash(l))
+
+    def _end_name_flash(self, lane: str) -> None:
+        fill = COLOR_NAME_HOVER if self._hover_lane == lane else COLOR_NAME
+        self.canvas.itemconfig(self.name_items[lane], fill=fill)
+
+    def _on_name_enter(self, lane: str) -> None:
+        self._hover_lane = lane
+        self.canvas.itemconfig(self.name_items[lane], fill=COLOR_NAME_HOVER)
+        self.canvas.configure(cursor="hand2")
+
+    def _on_name_leave(self, lane: str) -> None:
+        if self._hover_lane == lane:
+            self._hover_lane = None
+        self.canvas.itemconfig(self.name_items[lane], fill=COLOR_NAME)
+        self.canvas.configure(cursor="")
+
+    def _on_reset_click(self, lane: str) -> None:
+        """Reset a lane fully back to the unknown (\"-\") state."""
+        self.timers[lane].clear()
+        self._render_row(lane)
+
+    def _on_icon_enter(self, lane: str) -> None:
+        _tag, bg_tag, fg_tag = self._reset_tags(lane)
+        self.canvas.itemconfig(bg_tag, fill=COLOR_ICON_BG_HOVER)
+        self.canvas.itemconfig(fg_tag, fill=COLOR_ICON_HOVER, outline=COLOR_ICON_HOVER)
+        self.canvas.configure(cursor="hand2")
+
+    def _on_icon_leave(self, lane: str) -> None:
+        _tag, bg_tag, fg_tag = self._reset_tags(lane)
+        self.canvas.itemconfig(bg_tag, fill=COLOR_ICON_BG)
+        self.canvas.itemconfig(fg_tag, fill=COLOR_ICON, outline=COLOR_ICON)
+        self.canvas.configure(cursor="")
 
     def _relayout(self) -> None:
-        """Recompute size/positions and rebuild the gradient (champion changes)."""
-        # Set current row texts so width measurement reflects real content.
+        """Recompute size/positions, redraw reset icons and the gradient."""
+        # Champion names may have changed (auto-detect) since the last layout.
         for lane in self.timers:
-            self.canvas.itemconfig(self.row_items[lane], text=self._row_text(lane, "0:00"))
+            self.canvas.itemconfig(self.name_items[lane], text=self.labels[lane])
 
-        # Width: the widest of any row and the hint.
-        widths = [self.hint_font.measure(self.canvas.itemcget(self.hint_item, "text"))]
-        widths += [
-            self.row_font.measure(self.canvas.itemcget(self.row_items[lane], "text"))
-            for lane in self.timers
-        ]
-        width = max(widths) + 2 * self.PAD_X
-
-        # Vertical stacking.
         row_h = self.row_font.metrics("linespace")
         hint_h = self.hint_font.metrics("linespace")
 
+        # Column widths: name (widest label), countdown, and the icon.
+        name_col_w = max(self.row_font.measure(self.labels[l]) for l in self.timers)
+        time_col_w = self.row_font.measure("0:00")
+        icon_d = 2 * self.ICON_R
+        content_w = (
+            self.PAD_X + name_col_w + self.GAP_NAME_TIME + time_col_w
+            + self.GAP_TIME_ICON + icon_d + self.PAD_X
+        )
+        hint_w = (
+            self.hint_font.measure(self.canvas.itemcget(self.hint_item, "text"))
+            + 2 * self.PAD_X
+        )
+        width = max(content_w, hint_w)
+
+        time_x = self.PAD_X + name_col_w + self.GAP_NAME_TIME
+        icon_cx = width - self.PAD_X - self.ICON_R
+
         y = self.PAD_TOP
         for lane in self.timers:
-            self.canvas.coords(self.row_items[lane], self.PAD_X, y)
+            cy = y + row_h / 2
+            self.canvas.coords(self.name_items[lane], self.PAD_X, cy)
+            self.canvas.coords(self.time_items[lane], time_x, cy)
+            self.canvas.delete(self._reset_tags(lane)[0])  # redraw at new position
+            self._draw_reset_icon(icon_cx, cy, lane)
             y += row_h + self.ROW_SPACING
+
         # Reserve hint space even when hidden so toggling never resizes/jumps.
         y += self.HINT_GAP - self.ROW_SPACING
         self.canvas.coords(self.hint_item, self.PAD_X, y)
@@ -346,11 +473,20 @@ class FlashOverlay:
     # ----- Input -----------------------------------------------------------
 
     def _register_hotkeys(self) -> None:
-        """Bind global hotkeys to start/reset timers."""
+        """Bind global hotkeys to start/reset timers (invalid keys are skipped)."""
         for key, lane in self.bindings.items():
-            keyboard.add_hotkey(key, self._start_lane, args=(lane,))
-        keyboard.add_hotkey(self.config["reset_all_key"], self._reset_all)
-        keyboard.add_hotkey(self.config["quit_key"], self.quit)
+            self._safe_add_hotkey(key, self._start_lane, lane)
+        self._safe_add_hotkey(self.config.get("reset_all_key"), self._reset_all)
+        self._safe_add_hotkey(self.config.get("quit_key"), self.quit)
+
+    def _safe_add_hotkey(self, key, callback, *args) -> None:
+        """Register a hotkey, ignoring blank/invalid keys instead of crashing."""
+        if not key or not str(key).strip():
+            return
+        try:
+            keyboard.add_hotkey(key, callback, args=args)
+        except Exception as exc:  # keyboard raises ValueError etc. on bad keys
+            print(f"[flash-timer] Ignoring invalid hotkey {key!r}: {exc}")
 
     def _watch_tab(self) -> None:
         """Track Tab held state globally and poll it to toggle the hint."""
@@ -407,18 +543,11 @@ class FlashOverlay:
         return f"{minutes}:{seconds:02d}"
 
     def _tick(self) -> None:
-        """Refresh every label once per second (keeps CPU near idle)."""
+        """Refresh every countdown once per second (keeps CPU near idle)."""
         self._refresh_auto_labels()
-        on = int(time.monotonic()) % 2 == 0  # blink phase for expired timers
-        for lane, timer in self.timers.items():
-            value = self._format(timer.remaining, timer.running)
-            if timer.running and timer.remaining <= 0:
-                color = COLOR_RED if on else COLOR_EXPIRED_DIM  # blink when up
-            else:
-                color = self._color_for(timer.remaining, timer.running)
-            self.canvas.itemconfig(
-                self.row_items[lane], text=self._row_text(lane, value), fill=color
-            )
+        blink_on = int(time.monotonic()) % 2 == 0  # blink phase for expired timers
+        for lane in self.timers:
+            self._render_row(lane, blink_on)
 
         self.root.after(1000, self._tick)
 

@@ -1,5 +1,4 @@
 # Local user configuration (varies per machine)
-config.json
 
 # Python
 __pycache__/
