@@ -48,6 +48,13 @@ COLOR_ICON_HOVER = "#e9edf5"
 COLOR_ICON_BG = "#161a22"     # subtle circular hit area
 COLOR_ICON_BG_HOVER = "#2a3140"
 
+# Interaction plates behind names/reset icons (kept subtle) and the full-window
+# drag surface shown while Tab is held. These are painted (non-chroma) so the
+# areas receive mouse events even when the background is fully transparent.
+COLOR_PLATE = "#12151d"
+COLOR_PLATE_HOVER = "#232a38"
+COLOR_DRAG_BG = "#0b0e14"
+
 # Settings panel palette (kept in keeping with the overlay's dark styling).
 COLOR_PANEL_BG = "#12141b"
 COLOR_PANEL_CARD = "#181b24"
@@ -314,12 +321,28 @@ class FlashOverlay:
         # Background gradient sits behind everything.
         self.bg_item = self.canvas.create_image(0, 0, anchor="nw")
 
+        # Full-window drag surface: shown only while Tab is held so the whole
+        # overlay becomes clickable/draggable (transparent pixels are otherwise
+        # click-through on Windows).
+        self.tab_bg_item = self.canvas.create_rectangle(
+            0, 0, 0, 0, fill=COLOR_DRAG_BG, outline="", state="hidden",
+        )
+
         # Each lane row: a champion name (start), a countdown value, and a reset
-        # icon. Interaction uses generous coordinate-based hitboxes (see the
-        # canvas bindings below) so the area *around* the text is clickable too.
+        # icon. Each name/reset has a solid (but subtle) "plate" behind it so the
+        # whole area is clickable/hoverable even at opacity 0, where empty pixels
+        # are click-through on Windows.
         self.name_items: dict[str, int] = {}
         self.time_items: dict[str, int] = {}
+        self.name_plates: dict[str, int] = {}
+        self.reset_plates: dict[str, int] = {}
         for lane in self.timers:
+            name_plate = self.canvas.create_rectangle(
+                0, 0, 0, 0, fill=COLOR_PLATE, outline="",
+            )
+            reset_plate = self.canvas.create_rectangle(
+                0, 0, 0, 0, fill=COLOR_PLATE, outline="",
+            )
             name_id = self.canvas.create_text(
                 0, 0, anchor="w", text=self.labels[lane],
                 font=self.row_font, fill=COLOR_NAME,
@@ -327,6 +350,8 @@ class FlashOverlay:
             time_id = self.canvas.create_text(
                 0, 0, anchor="w", text="-", font=self.row_font, fill=COLOR_IDLE
             )
+            self.name_plates[lane] = name_plate
+            self.reset_plates[lane] = reset_plate
             self.name_items[lane] = name_id
             self.time_items[lane] = time_id
 
@@ -573,15 +598,24 @@ class FlashOverlay:
         self.root.after(200, lambda l=lane: self._end_name_flash(l))
 
     def _reset_timer(self, lane: str) -> None:
-        """Reset a lane fully back to the unknown (\"-\") state."""
+        """Reset a lane fully back to the unknown (\"-\") state (with feedback)."""
         self.timers[lane].clear()
         self._render_row(lane)
+        _tag, fg_tag = self._reset_tags(lane)
+        self.canvas.itemconfig(fg_tag, fill=COLOR_START_FLASH, outline=COLOR_START_FLASH)
+        self.root.after(180, lambda l=lane: self._end_reset_flash(l))
 
     def _end_name_flash(self, lane: str) -> None:
         hovered = self._hover == ("name", lane)
         self.canvas.itemconfig(
             self.name_items[lane], fill=COLOR_NAME_HOVER if hovered else COLOR_NAME
         )
+
+    def _end_reset_flash(self, lane: str) -> None:
+        hovered = self._hover == ("reset", lane)
+        color = COLOR_NAME_HOVER if hovered else COLOR_NAME
+        _tag, fg_tag = self._reset_tags(lane)
+        self.canvas.itemconfig(fg_tag, fill=color, outline=color)
 
     def _set_hover(self, hit: tuple[str, str] | None) -> None:
         """Apply/clear the hover effect for the name or reset icon under cursor."""
@@ -592,9 +626,11 @@ class FlashOverlay:
             kind, role = self._hover
             if kind == "name":
                 self.canvas.itemconfig(self.name_items[role], fill=COLOR_NAME)
+                self.canvas.itemconfig(self.name_plates[role], fill=COLOR_PLATE)
             elif kind == "reset":
                 _tag, fg_tag = self._reset_tags(role)
                 self.canvas.itemconfig(fg_tag, fill=COLOR_NAME, outline=COLOR_NAME)
+                self.canvas.itemconfig(self.reset_plates[role], fill=COLOR_PLATE)
         self._hover = hit
         # Apply the new hover.
         if hit is None:
@@ -603,9 +639,11 @@ class FlashOverlay:
         kind, role = hit
         if kind == "name":
             self.canvas.itemconfig(self.name_items[role], fill=COLOR_NAME_HOVER)
+            self.canvas.itemconfig(self.name_plates[role], fill=COLOR_PLATE_HOVER)
         elif kind == "reset":
             _tag, fg_tag = self._reset_tags(role)
             self.canvas.itemconfig(fg_tag, fill=COLOR_NAME_HOVER, outline=COLOR_NAME_HOVER)
+            self.canvas.itemconfig(self.reset_plates[role], fill=COLOR_PLATE_HOVER)
         self.canvas.configure(cursor="hand2")
 
     def _relayout(self) -> None:
@@ -646,14 +684,19 @@ class FlashOverlay:
             self.canvas.coords(self.time_items[lane], time_x, cy)
             self._draw_reset_icon(reset_cx, cy, lane)
             # Generous, text-independent hitboxes for name (start) and reset.
-            self._name_boxes[lane] = (
+            name_box = (
                 self.PAD_X - pad, row_top,
                 self.PAD_X + name_col_w + pad, row_top + row_h,
             )
-            self._reset_boxes[lane] = (
+            reset_box = (
                 reset_cx - self.RESET_R - pad, row_top,
                 reset_cx + self.RESET_R + pad, row_top + row_h,
             )
+            self._name_boxes[lane] = name_box
+            self._reset_boxes[lane] = reset_box
+            # Solid (subtle) plates make the whole hitbox clickable/hoverable.
+            self.canvas.coords(self.name_plates[lane], *name_box)
+            self.canvas.coords(self.reset_plates[lane], *reset_box)
             y += row_h + self.ROW_SPACING
 
         # Reserve hint space even when hidden so toggling never resizes/jumps.
@@ -672,7 +715,20 @@ class FlashOverlay:
         x = self.root.winfo_x()
         wy = self.root.winfo_y()
         self.root.geometry(f"{width}x{height}+{x}+{wy}")
+        self.canvas.coords(self.tab_bg_item, 0, 0, width, height)
         self._draw_gradient(width, height)
+        self._restack()
+
+    def _restack(self) -> None:
+        """Keep z-order: gradient < drag surface < plates < text/icons < hints."""
+        self.canvas.tag_lower(self.bg_item)  # gradient at the very bottom
+        self.canvas.tag_raise(self.tab_bg_item, self.bg_item)
+        for lane in self.timers:
+            self.canvas.tag_raise(self.name_plates[lane], self.tab_bg_item)
+            self.canvas.tag_raise(self.reset_plates[lane], self.tab_bg_item)
+            self.canvas.tag_raise(self.name_items[lane])
+            self.canvas.tag_raise(self.time_items[lane])
+            self.canvas.tag_raise(self._reset_tags(lane)[0])
 
     def _draw_gradient(self, w: int, h: int) -> None:
         """Render the diagonal black gradient (darkest at the bottom-left).
@@ -763,12 +819,13 @@ class FlashOverlay:
         self._poll_hint()
 
     def _poll_hint(self) -> None:
-        """Show the key-binding hint and icons only while Tab is held."""
+        """Show the key-binding hint, icons and drag surface only while Tab is held."""
         state = "normal" if self._tab_held else "hidden"
         if self.canvas.itemcget(self.hint_item, "state") != state:
             self.canvas.itemconfig(self.hint_item, state=state)
             self.canvas.itemconfig("gear", state=state)
             self.canvas.itemconfig("close", state=state)
+            self.canvas.itemconfig(self.tab_bg_item, state=state)
         self.root.after(120, self._poll_hint)
 
     def _start_lane(self, lane: str) -> None:
@@ -981,10 +1038,13 @@ class SettingsWindow:
 
         self._build()
 
-        # Open next to the overlay.
-        ox = overlay.root.winfo_x()
-        oy = overlay.root.winfo_y()
-        self.win.geometry(f"+{ox + 24}+{max(24, oy - 60)}")
+        # Always open centred on the screen.
+        self.win.update_idletasks()
+        w = self.win.winfo_reqwidth()
+        h = self.win.winfo_reqheight()
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        self.win.geometry(f"+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2)}")
 
     # ----- lifecycle -------------------------------------------------------
 
