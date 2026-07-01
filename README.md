@@ -31,11 +31,15 @@ classic numpad layout:
 | Esc    | Quit    |
 
 Press a lane key again to restart that timer back to full duration.
-Hold **Tab** to reveal the key-binding hints and the settings gear (both hidden
-otherwise). Unbound lanes show `--` in the hint line.
+Hold **Tab** to reveal the settings gear and close (x) icons, plus the
+key-binding hints. The hints only appear for lanes that actually have a key
+bound (nothing is shown when no keys are bound).
 
-You can also **click a champion name** to start its timer and click the small
-reset icon on each row to clear it.
+You can also **click a champion name** (or the area around it) to start its
+timer, and click the **reset** icon after the countdown to clear it.
+
+**Hold Tab to drag** the overlay from anywhere on its surface, and click the
+**x** icon (only shown while Tab is held) to close it.
 
 > **Anti-misfire (optional):** enable *double-press keybinds* and/or
 > *double-click name / reset* in the settings panel so a timer only starts on a
@@ -45,10 +49,13 @@ reset icon on each row to clear it.
 ## Settings panel
 
 Hold **Tab** and click the small **gear** on the hint line to open the settings
-window. It matches the overlay's dark styling and lets you:
+window. It is a clean, borderless panel (no OS title bar) that matches the
+overlay's dark styling — drag it by its header, and close it with its own
+**Close** button. It lets you:
 
 - **Set the Flash cooldown** (seconds).
 - **Drag an opacity slider** that updates the overlay live.
+- **Drag a window-size slider** that scales the text and window proportionally.
 - Toggle **double-press keybinds** and **double-click name / reset**.
 - Toggle **always on top** and **auto-detect champion names**.
 - **Rebind any key** — click a key, then press the new key (Esc cancels,
@@ -61,9 +68,12 @@ Changes apply immediately and are saved to `config.json`.
 
 - No title text — just the timers on a smooth diagonal black gradient that is
   darkest (most readable) at the bottom-left and softer toward the top-right.
-- `opacity` (0–1) sets how see-through the background is. On Windows the
-  background uses a transparent colour key, so even at `opacity: 0` the
-  background is completely clear while the **text stays fully visible**.
+- `opacity` (0–1) sets how see-through the background is (**defaults to 0**).
+  On Windows the background uses a transparent colour key, so even at
+  `opacity: 0` the background is completely clear while the **text stays fully
+  visible**.
+- `ui_scale` scales the text and window size proportionally (adjust it live via
+  the settings panel's window-size slider).
 
 ## Colours
 
@@ -77,7 +87,8 @@ Changes apply immediately and are saved to `config.json`.
 Everything lives in `config.json` — no need to touch the code:
 
 - `flash_seconds` — cooldown length (use `240` for Cosmic Insight)
-- `always_on_top` / `opacity` — overlay behaviour
+- `always_on_top` / `opacity` — overlay behaviour (`opacity` defaults to `0`)
+- `ui_scale` — overlay text/window size multiplier
 - `corner` — start position (`bottom-left`, `top-left`, `top-right`, `bottom-right`)
 - `roles` — the lanes shown (defaults to Top/Jungle/Mid/Bot/Support)
 - `bindings` — lane → key (empty string means unbound)
@@ -85,7 +96,8 @@ Everything lives in `config.json` — no need to touch the code:
 - `champions` / `auto_champions` / `track_team` — champion-name labels
 - `reset_all_key`, `quit_key`
 
-Drag the overlay anywhere on its surface; its position is saved on exit.
+Drag the overlay by **holding Tab** and dragging anywhere on its surface; its
+position is saved on exit.
 
 > Global hotkeys via the `keyboard` library work best on Windows and may
 > require running as administrator.

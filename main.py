@@ -96,7 +96,8 @@ _BAYER8 = [[(v + 0.5) / 64 for v in row] for row in _BAYER8_RAW]
 DEFAULT_CONFIG = {
     "flash_seconds": 300,
     "always_on_top": True,
-    "opacity": 0.85,
+    "opacity": 0.0,
+    "ui_scale": 1.0,
     "corner": "bottom-left",
     "roles": list(DEFAULT_ROLES),
     # role -> key. Empty string means the role has no key bound.
@@ -171,17 +172,29 @@ class FlashTimer:
 class FlashOverlay:
     """Tkinter overlay that renders all lane Flash timers on a gradient canvas."""
 
-    # Layout metrics (pixels).
+    # Layout metrics (pixels, at 1.0 scale).
     PAD_X = 16
     PAD_TOP = 12
     PAD_BOTTOM = 12
     ROW_SPACING = 6
     HINT_GAP = 8
     GAP_NAME_TIME = 18  # space between the name column and the countdown
-    GAP_TIME_ICON = 16  # space between the countdown and the reset icon
-    ICON_R = 10         # reset icon (circular hit area) radius
+    GAP_TIME_ICON = 12  # space between the countdown and the reset icon
+    RESET_R = 9         # reset icon (circular arrow) radius
+    HIT_PAD = 6         # extra padding around the name/reset click hitboxes
     GEAR_R = 8          # settings gear (shown on the Tab hint line) radius
     CLOSE_R = 8         # close (x) icon (shown on the Tab hint line) radius
+    BASE_ROW_FONT = 18  # countdown/name font size at 1.0 scale
+    BASE_HINT_FONT = 9  # hint-line font size at 1.0 scale
+    MIN_SCALE = 0.6
+    MAX_SCALE = 2.5
+
+    # Metrics multiplied by the UI scale factor.
+    _SCALED_METRICS = (
+        "PAD_X", "PAD_TOP", "PAD_BOTTOM", "ROW_SPACING", "HINT_GAP",
+        "GAP_NAME_TIME", "GAP_TIME_ICON", "RESET_R", "HIT_PAD",
+        "GEAR_R", "CLOSE_R",
+    )
 
     def __init__(self, config: dict) -> None:
         self.config = config
@@ -220,7 +233,10 @@ class FlashOverlay:
         self._last_press: dict[str, float] = {}
 
         self._tab_held = False  # show key hints only while Tab is held
-        self._hover_lane: str | None = None  # lane whose name is hovered
+        self._hover: tuple[str, str] | None = None  # (kind, role) under the pointer
+        self._drag_active = False  # dragging the overlay (only while Tab is held)
+        self._name_boxes: dict[str, tuple[float, float, float, float]] = {}
+        self._reset_boxes: dict[str, tuple[float, float, float, float]] = {}
         self._win_w = 0
         self._win_h = 0
         self._grad_img: tk.PhotoImage | None = None
@@ -228,6 +244,11 @@ class FlashOverlay:
         self._use_chroma = False
         self._opacity_job: str | None = None  # debounce handle for live opacity
         self.settings_win: "SettingsWindow | None" = None
+
+        # UI scale multiplies fonts and layout metrics proportionally.
+        self.row_font: tkfont.Font | None = None
+        self.hint_font: tkfont.Font | None = None
+        self._apply_scale(config.get("ui_scale", 1.0))
 
         self.root = tk.Tk()
         self.root.title("")
@@ -265,12 +286,27 @@ class FlashOverlay:
                 bindings[b] = str(a or "")
         return bindings
 
+    def _apply_scale(self, scale: float) -> None:
+        """Set the UI scale, updating layout metrics and (if built) fonts."""
+        cls = type(self)
+        self.scale = max(cls.MIN_SCALE, min(cls.MAX_SCALE, float(scale)))
+        for attr in cls._SCALED_METRICS:
+            setattr(self, attr, max(1, round(getattr(cls, attr) * self.scale)))
+        if self.row_font is not None:
+            self.row_font.configure(size=max(6, round(cls.BASE_ROW_FONT * self.scale)))
+            self.hint_font.configure(size=max(5, round(cls.BASE_HINT_FONT * self.scale)))
+
     # ----- UI construction -------------------------------------------------
 
     def _build_ui(self) -> None:
         """Create the canvas, fonts and text items, then size everything."""
-        self.row_font = tkfont.Font(family="Consolas", size=18, weight="bold")
-        self.hint_font = tkfont.Font(family="Consolas", size=9)
+        self.row_font = tkfont.Font(
+            family="Consolas", size=max(6, round(self.BASE_ROW_FONT * self.scale)),
+            weight="bold",
+        )
+        self.hint_font = tkfont.Font(
+            family="Consolas", size=max(5, round(self.BASE_HINT_FONT * self.scale)),
+        )
 
         self.canvas = tk.Canvas(self.root, highlightthickness=0, bd=0, bg=CHROMA)
         self.canvas.pack(fill="both", expand=True)
@@ -278,8 +314,9 @@ class FlashOverlay:
         # Background gradient sits behind everything.
         self.bg_item = self.canvas.create_image(0, 0, anchor="nw")
 
-        # Each lane row: a clickable champion name (start), a countdown value,
-        # and a reset icon (drawn per-row later in _relayout).
+        # Each lane row: a champion name (start), a countdown value, and a reset
+        # icon. Interaction uses generous coordinate-based hitboxes (see the
+        # canvas bindings below) so the area *around* the text is clickable too.
         self.name_items: dict[str, int] = {}
         self.time_items: dict[str, int] = {}
         for lane in self.timers:
@@ -292,11 +329,6 @@ class FlashOverlay:
             )
             self.name_items[lane] = name_id
             self.time_items[lane] = time_id
-            # Click the name to start the timer; hovering "sharpens" it.
-            self.canvas.tag_bind(name_id, "<Button-1>", lambda _e, l=lane: self._on_name_click(l, False))
-            self.canvas.tag_bind(name_id, "<Double-Button-1>", lambda _e, l=lane: self._on_name_click(l, True))
-            self.canvas.tag_bind(name_id, "<Enter>", lambda _e, l=lane: self._on_name_enter(l))
-            self.canvas.tag_bind(name_id, "<Leave>", lambda _e, l=lane: self._on_name_leave(l))
 
         self.hint_item = self.canvas.create_text(
             0, 0, anchor="nw", text=self._hint_text(), font=self.hint_font,
@@ -307,54 +339,58 @@ class FlashOverlay:
         self._gear_bound = False
         self._close_bound = False
 
-        self._make_draggable()
+        # Canvas-level interaction: name/reset hitboxes and Tab-to-drag.
+        self.canvas.bind("<Button-1>", self._on_press)
+        self.canvas.bind("<Double-Button-1>", self._on_double_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", lambda _e: self._set_hover(None))
+
         self._relayout()
 
     def _draw_reset_icon(self, cx: float, cy: float, lane: str) -> None:
-        """Draw a small, easy-to-click restart icon (circular arrow) for a lane."""
-        tag, bg_tag, fg_tag = self._reset_tags(lane)
-        r = self.ICON_R
+        """Draw the reset icon: a clear-background circular arrow in name colour.
 
-        # Subtle filled circle acts as the (generous) click target.
-        self.canvas.create_oval(
-            cx - r, cy - r, cx + r, cy + r,
-            fill=COLOR_ICON_BG, outline="", tags=(tag, bg_tag),
-        )
+        Interaction (click/hover) is handled by the row's coordinate hitbox, so
+        no per-item bindings are attached here.
+        """
+        tag, fg_tag = self._reset_tags(lane)
+        self.canvas.delete(tag)
+        r = self.RESET_R
+
         # Circular arrow ring with a gap where the arrowhead goes.
-        rr = r - 4
         self.canvas.create_arc(
-            cx - rr, cy - rr, cx + rr, cy + rr,
+            cx - r, cy - r, cx + r, cy + r,
             start=60, extent=270, style="arc",
-            outline=COLOR_ICON, width=2, tags=(tag, fg_tag),
+            outline=COLOR_NAME, width=2, tags=(tag, fg_tag),
         )
         # Arrowhead at the open end of the ring (makes it read as "restart").
         end = math.radians(60 + 270)
-        tx = cx + rr * math.cos(end)
-        ty = cy - rr * math.sin(end)
+        tx = cx + r * math.cos(end)
+        ty = cy - r * math.sin(end)
         dirx, diry = -math.sin(end), -math.cos(end)  # CCW tangent (screen coords)
         perpx, perpy = -diry, dirx
-        ah = 4.0
+        ah = r * 0.55
         self.canvas.create_polygon(
             tx + dirx * ah, ty + diry * ah,
             tx + perpx * ah, ty + perpy * ah,
             tx - perpx * ah, ty - perpy * ah,
-            fill=COLOR_ICON, outline="", tags=(tag, fg_tag),
+            fill=COLOR_NAME, outline="", tags=(tag, fg_tag),
         )
-
-        self.canvas.tag_bind(tag, "<Button-1>", lambda _e, l=lane: self._on_reset_click(l, False))
-        self.canvas.tag_bind(tag, "<Double-Button-1>", lambda _e, l=lane: self._on_reset_click(l, True))
-        self.canvas.tag_bind(tag, "<Enter>", lambda _e, l=lane: self._on_icon_enter(l))
-        self.canvas.tag_bind(tag, "<Leave>", lambda _e, l=lane: self._on_icon_leave(l))
 
     # ----- Settings gear ---------------------------------------------------
 
     def _hint_text(self) -> str:
-        """Build the Tab-only hint line: `Role:Key` (unbound shown as `--`)."""
-        parts = []
-        for role in self.roles:
-            key = self.bindings.get(role, "")
-            disp = key.replace("num ", "Num") if key else "--"
-            parts.append(f"{role}:{disp}")
+        """Build the Tab-only hint line, listing only roles that have a key.
+
+        Returns an empty string when nothing is bound, so no hint is shown.
+        """
+        parts = [
+            f"{role}:{self.bindings[role].replace('num ', 'Num')}"
+            for role in self.roles
+            if self.bindings.get(role)
+        ]
         return "  ".join(parts)
 
     def _draw_gear(self, cx: float, cy: float) -> None:
@@ -371,7 +407,7 @@ class FlashOverlay:
         )
         # Cog silhouette: alternate outer/inner radius to form the teeth.
         teeth = 8
-        r_out, r_in = r - 1.0, r - 3.5
+        r_out, r_in = r * 0.92, r * 0.55
         pts: list[float] = []
         for i in range(teeth * 2):
             ang = math.pi * i / teeth
@@ -424,7 +460,7 @@ class FlashOverlay:
             fill=COLOR_ICON_BG, outline="", state=vis,
             tags=("close", "close-bg"),
         )
-        d = r - 4
+        d = r * 0.5
         self.canvas.create_line(
             cx - d, cy - d, cx + d, cy + d, fill=COLOR_ICON, width=2,
             capstyle="round", state=vis, tags=("close", "close-fg"),
@@ -463,53 +499,114 @@ class FlashOverlay:
     # ----- Mouse interaction ----------------------------------------------
 
     @staticmethod
-    def _reset_tags(lane: str) -> tuple[str, str, str]:
+    def _reset_tags(lane: str) -> tuple[str, str]:
         """Canvas tag names for a lane's reset icon (space-safe)."""
         safe = lane.replace(" ", "_")
-        return f"reset-{safe}", f"reset-bg-{safe}", f"reset-fg-{safe}"
+        return f"reset-{safe}", f"reset-fg-{safe}"
 
-    def _on_name_click(self, lane: str, double: bool = False) -> None:
-        """Start (or restart) a lane's timer and flash the name as feedback."""
+    @staticmethod
+    def _in_box(x: float, y: float, box: tuple[float, float, float, float]) -> bool:
+        x0, y0, x1, y1 = box
+        return x0 <= x <= x1 and y0 <= y <= y1
+
+    def _hit_test(self, x: float, y: float) -> tuple[str, str] | None:
+        """Return (kind, role) for the name/reset hitbox under the pointer."""
+        for role, box in self._reset_boxes.items():
+            if self._in_box(x, y, box):
+                return ("reset", role)
+        for role, box in self._name_boxes.items():
+            if self._in_box(x, y, box):
+                return ("name", role)
+        return None
+
+    def _on_press(self, event: tk.Event) -> None:
+        # Holding Tab turns the whole overlay into a drag handle.
+        if self._tab_held:
+            self._drag_active = True
+            self._drag = {"x": event.x, "y": event.y}
+            return
+        hit = self._hit_test(event.x, event.y)
+        if hit is not None:
+            self._activate(hit, double=False)
+
+    def _on_double_press(self, event: tk.Event) -> None:
+        if self._tab_held:
+            return
+        hit = self._hit_test(event.x, event.y)
+        if hit is not None:
+            self._activate(hit, double=True)
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if not self._drag_active:
+            return
+        x = self.root.winfo_x() + event.x - self._drag["x"]
+        y = self.root.winfo_y() + event.y - self._drag["y"]
+        self.root.geometry(f"+{x}+{y}")
+
+    def _on_release(self, _event: tk.Event) -> None:
+        self._drag_active = False
+
+    def _on_motion(self, event: tk.Event) -> None:
+        if self._drag_active:
+            return
+        if self._tab_held:
+            self._set_hover(None)
+            self.canvas.configure(cursor="fleur")  # move cursor in drag mode
+            return
+        self._set_hover(self._hit_test(event.x, event.y))
+
+    def _activate(self, hit: tuple[str, str], double: bool) -> None:
+        """Run a name/reset action, honouring the double-click-mouse option."""
         if self.double_click_mouse and not double:
             return  # anti-misclick: only a double-click counts
+        kind, role = hit
+        if kind == "name":
+            self._start_timer(role)
+        elif kind == "reset":
+            self._reset_timer(role)
+
+    def _start_timer(self, lane: str) -> None:
+        """Start (or restart) a lane's timer and flash the name as feedback."""
         self.timers[lane].start()
         self._render_row(lane)
         self.canvas.itemconfig(self.name_items[lane], fill=COLOR_START_FLASH)
         self.root.after(200, lambda l=lane: self._end_name_flash(l))
 
-    def _end_name_flash(self, lane: str) -> None:
-        fill = COLOR_NAME_HOVER if self._hover_lane == lane else COLOR_NAME
-        self.canvas.itemconfig(self.name_items[lane], fill=fill)
-
-    def _on_name_enter(self, lane: str) -> None:
-        self._hover_lane = lane
-        self.canvas.itemconfig(self.name_items[lane], fill=COLOR_NAME_HOVER)
-        self.canvas.configure(cursor="hand2")
-
-    def _on_name_leave(self, lane: str) -> None:
-        if self._hover_lane == lane:
-            self._hover_lane = None
-        self.canvas.itemconfig(self.name_items[lane], fill=COLOR_NAME)
-        self.canvas.configure(cursor="")
-
-    def _on_reset_click(self, lane: str, double: bool = False) -> None:
+    def _reset_timer(self, lane: str) -> None:
         """Reset a lane fully back to the unknown (\"-\") state."""
-        if self.double_click_mouse and not double:
-            return  # anti-misclick: only a double-click counts
         self.timers[lane].clear()
         self._render_row(lane)
 
-    def _on_icon_enter(self, lane: str) -> None:
-        _tag, bg_tag, fg_tag = self._reset_tags(lane)
-        self.canvas.itemconfig(bg_tag, fill=COLOR_ICON_BG_HOVER)
-        self.canvas.itemconfig(fg_tag, fill=COLOR_ICON_HOVER, outline=COLOR_ICON_HOVER)
-        self.canvas.configure(cursor="hand2")
+    def _end_name_flash(self, lane: str) -> None:
+        hovered = self._hover == ("name", lane)
+        self.canvas.itemconfig(
+            self.name_items[lane], fill=COLOR_NAME_HOVER if hovered else COLOR_NAME
+        )
 
-    def _on_icon_leave(self, lane: str) -> None:
-        _tag, bg_tag, fg_tag = self._reset_tags(lane)
-        self.canvas.itemconfig(bg_tag, fill=COLOR_ICON_BG)
-        self.canvas.itemconfig(fg_tag, fill=COLOR_ICON, outline=COLOR_ICON)
-        self.canvas.configure(cursor="")
+    def _set_hover(self, hit: tuple[str, str] | None) -> None:
+        """Apply/clear the hover effect for the name or reset icon under cursor."""
+        if hit == self._hover:
+            return
+        # Clear the previous hover.
+        if self._hover is not None:
+            kind, role = self._hover
+            if kind == "name":
+                self.canvas.itemconfig(self.name_items[role], fill=COLOR_NAME)
+            elif kind == "reset":
+                _tag, fg_tag = self._reset_tags(role)
+                self.canvas.itemconfig(fg_tag, fill=COLOR_NAME, outline=COLOR_NAME)
+        self._hover = hit
+        # Apply the new hover.
+        if hit is None:
+            self.canvas.configure(cursor="")
+            return
+        kind, role = hit
+        if kind == "name":
+            self.canvas.itemconfig(self.name_items[role], fill=COLOR_NAME_HOVER)
+        elif kind == "reset":
+            _tag, fg_tag = self._reset_tags(role)
+            self.canvas.itemconfig(fg_tag, fill=COLOR_NAME_HOVER, outline=COLOR_NAME_HOVER)
+        self.canvas.configure(cursor="hand2")
 
     def _relayout(self) -> None:
         """Recompute size/positions, redraw reset icons and the gradient."""
@@ -520,14 +617,13 @@ class FlashOverlay:
         row_h = self.row_font.metrics("linespace")
         hint_h = self.hint_font.metrics("linespace")
 
-        # Column widths: name (widest label), countdown, and the icon.
+        # Column widths: name (widest label), countdown, then the reset icon
+        # sits directly after the countdown.
         name_col_w = max(self.row_font.measure(self.labels[l]) for l in self.timers)
         time_col_w = self.row_font.measure("0:00")
-        icon_d = 2 * self.ICON_R
-        content_w = (
-            self.PAD_X + name_col_w + self.GAP_NAME_TIME + time_col_w
-            + self.GAP_TIME_ICON + icon_d + self.PAD_X
-        )
+        time_x = self.PAD_X + name_col_w + self.GAP_NAME_TIME
+        reset_cx = time_x + time_col_w + self.GAP_TIME_ICON + self.RESET_R
+        content_w = reset_cx + self.RESET_R + self.PAD_X
         # The hint line also carries the close (x) and settings (gear) icons.
         self.canvas.itemconfig(self.hint_item, text=self._hint_text())
         gear_space = (
@@ -539,16 +635,25 @@ class FlashOverlay:
         )
         width = max(content_w, hint_w)
 
-        time_x = self.PAD_X + name_col_w + self.GAP_NAME_TIME
-        icon_cx = width - self.PAD_X - self.ICON_R
-
+        pad = self.HIT_PAD
+        self._name_boxes.clear()
+        self._reset_boxes.clear()
         y = self.PAD_TOP
         for lane in self.timers:
+            row_top = y
             cy = y + row_h / 2
             self.canvas.coords(self.name_items[lane], self.PAD_X, cy)
             self.canvas.coords(self.time_items[lane], time_x, cy)
-            self.canvas.delete(self._reset_tags(lane)[0])  # redraw at new position
-            self._draw_reset_icon(icon_cx, cy, lane)
+            self._draw_reset_icon(reset_cx, cy, lane)
+            # Generous, text-independent hitboxes for name (start) and reset.
+            self._name_boxes[lane] = (
+                self.PAD_X - pad, row_top,
+                self.PAD_X + name_col_w + pad, row_top + row_h,
+            )
+            self._reset_boxes[lane] = (
+                reset_cx - self.RESET_R - pad, row_top,
+                reset_cx + self.RESET_R + pad, row_top + row_h,
+            )
             y += row_h + self.ROW_SPACING
 
         # Reserve hint space even when hidden so toggling never resizes/jumps.
@@ -602,22 +707,6 @@ class FlashOverlay:
         self._grad_img = img  # keep a reference so it isn't garbage-collected
         self.canvas.itemconfig(self.bg_item, image=img)
         self.canvas.tag_lower(self.bg_item)  # keep behind the text
-
-    def _make_draggable(self) -> None:
-        """Drag the borderless overlay from anywhere on the canvas."""
-        self._drag = {"x": 0, "y": 0}
-
-        def start(event: tk.Event) -> None:
-            self._drag["x"] = event.x
-            self._drag["y"] = event.y
-
-        def move(event: tk.Event) -> None:
-            x = self.root.winfo_x() + event.x - self._drag["x"]
-            y = self.root.winfo_y() + event.y - self._drag["y"]
-            self.root.geometry(f"+{x}+{y}")
-
-        self.canvas.bind("<Button-1>", start)
-        self.canvas.bind("<B1-Motion>", move)
 
     def _place_window(self) -> None:
         """Restore saved position, or anchor to the configured screen corner."""
@@ -705,6 +794,13 @@ class FlashOverlay:
         for timer in self.timers.values():
             timer.duration = self.duration
         self.config["flash_seconds"] = self.duration
+        save_config(self.config)
+
+    def set_ui_scale(self, value: float) -> None:
+        """Resize the overlay (fonts + layout) proportionally, live."""
+        self._apply_scale(value)
+        self.config["ui_scale"] = self.scale
+        self._relayout()
         save_config(self.config)
 
     def set_opacity(self, value: float, *, persist: bool = False) -> None:
@@ -867,16 +963,21 @@ class SettingsWindow:
         self.overlay = overlay
         self._capturing = False
         self._key_buttons: dict[str, tk.Button] = {}
+        self._move = {"x": 0, "y": 0}
 
         self.win = tk.Toplevel(overlay.root)
-        self.win.title("Flash Timer - Settings")
-        self.win.configure(bg=COLOR_PANEL_BG)
+        self.win.overrideredirect(True)  # borderless: no OS title bar / X button
+        self.win.configure(bg=COLOR_FIELD_ACTIVE)  # thin border colour
         self.win.resizable(False, False)
         try:
             self.win.attributes("-topmost", True)
         except tk.TclError:
             pass
         self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        # Inner body (1px inset gives a subtle border against the game behind).
+        self.body = tk.Frame(self.win, bg=COLOR_PANEL_BG)
+        self.body.pack(fill="both", expand=True, padx=1, pady=1)
 
         self._build()
 
@@ -953,19 +1054,48 @@ class SettingsWindow:
         opts.update(kw)
         return tk.Button(parent, text=text, **opts)
 
+    def _make_scale(self, parent, frm, to, res, initial, command) -> tk.Scale:
+        """A slider styled for high contrast: bright handle on a near-black track."""
+        scale = tk.Scale(
+            parent, from_=frm, to=to, resolution=res, orient="horizontal",
+            showvalue=False, command=command, bg=COLOR_ACCENT, fg=COLOR_PANEL_FG,
+            troughcolor="#0a0c11", highlightthickness=0, bd=0,
+            sliderrelief="raised", activebackground="#8fbcff",
+            length=240, width=14, sliderlength=26,
+        )
+        scale.set(initial)
+        return scale
+
+    def _start_move(self, event: tk.Event) -> None:
+        self._move = {"x": event.x_root, "y": event.y_root}
+
+    def _on_move(self, event: tk.Event) -> None:
+        dx = event.x_root - self._move["x"]
+        dy = event.y_root - self._move["y"]
+        self._move = {"x": event.x_root, "y": event.y_root}
+        self.win.geometry(f"+{self.win.winfo_x() + dx}+{self.win.winfo_y() + dy}")
+
     # ----- construction ----------------------------------------------------
 
     def _build(self) -> None:
         ov = self.overlay
-        header = tk.Label(
-            self.win, text="\u2699  Settings", bg=COLOR_PANEL_BG, fg=COLOR_PANEL_FG,
-            font=("Consolas", 13, "bold"), anchor="w",
+        body = self.body
+
+        # Draggable header (replaces the removed OS title bar).
+        header = tk.Frame(body, bg=COLOR_PANEL_BG)
+        header.pack(fill="x")
+        title = tk.Label(
+            header, text="\u2699  Settings", bg=COLOR_PANEL_BG, fg=COLOR_PANEL_FG,
+            font=("Consolas", 13, "bold"), anchor="w", cursor="fleur",
         )
-        header.pack(fill="x", padx=16, pady=(14, 2))
+        title.pack(fill="x", padx=16, pady=(12, 2))
+        for widget in (header, title):
+            widget.bind("<Button-1>", self._start_move)
+            widget.bind("<B1-Motion>", self._on_move)
 
         # --- General ---
-        self._heading(self.win, "General")
-        card = self._card(self.win)
+        self._heading(body, "General")
+        card = self._card(body)
 
         flash_row = tk.Frame(card, bg=COLOR_PANEL_CARD)
         flash_row.pack(fill="x", padx=12, pady=6)
@@ -984,25 +1114,32 @@ class SettingsWindow:
         spin.bind("<FocusOut>", lambda _e: self._on_flash())
 
         op_row = tk.Frame(card, bg=COLOR_PANEL_CARD)
-        op_row.pack(fill="x", padx=12, pady=(0, 8))
+        op_row.pack(fill="x", padx=12, pady=(0, 2))
         self._row_label(op_row, "Opacity").pack(side="left")
         self.opacity_pct = tk.Label(
             op_row, text=f"{int(ov.opacity * 100)}%", bg=COLOR_PANEL_CARD,
             fg=COLOR_ACCENT, font=("Consolas", 10), width=5, anchor="e",
         )
         self.opacity_pct.pack(side="right")
-        opacity_scale = tk.Scale(
-            card, from_=0.0, to=1.0, resolution=0.01, orient="horizontal",
-            showvalue=False, command=self._on_opacity, bg=COLOR_PANEL_CARD,
-            fg=COLOR_PANEL_FG, troughcolor=COLOR_FIELD_BG, highlightthickness=0,
-            bd=0, sliderrelief="flat", activebackground=COLOR_ACCENT, length=240,
+        self._make_scale(
+            card, 0.0, 1.0, 0.01, ov.opacity, self._on_opacity,
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        size_row = tk.Frame(card, bg=COLOR_PANEL_CARD)
+        size_row.pack(fill="x", padx=12, pady=(0, 2))
+        self._row_label(size_row, "Window size").pack(side="left")
+        self.scale_pct = tk.Label(
+            size_row, text=f"{int(round(ov.scale * 100))}%", bg=COLOR_PANEL_CARD,
+            fg=COLOR_ACCENT, font=("Consolas", 10), width=5, anchor="e",
         )
-        opacity_scale.set(ov.opacity)
-        opacity_scale.pack(fill="x", padx=12, pady=(0, 10))
+        self.scale_pct.pack(side="right")
+        self._make_scale(
+            card, ov.MIN_SCALE, ov.MAX_SCALE, 0.05, ov.scale, self._on_scale,
+        ).pack(fill="x", padx=12, pady=(0, 10))
 
         # --- Behaviour ---
-        self._heading(self.win, "Behaviour")
-        card = self._card(self.win)
+        self._heading(body, "Behaviour")
+        card = self._card(body)
         self._make_check(
             card, "Double-press keybinds (anti-misfire)",
             ov.double_press_keys, ov.set_double_press_keys,
@@ -1021,8 +1158,8 @@ class SettingsWindow:
         )
 
         # --- Keybinds ---
-        self._heading(self.win, "Keybinds")
-        card = self._card(self.win)
+        self._heading(body, "Keybinds")
+        card = self._card(body)
         rows = [(role, role) for role in ov.roles] + self._KEY_ROWS_EXTRA
         for ident, label in rows:
             row = tk.Frame(card, bg=COLOR_PANEL_CARD)
@@ -1045,14 +1182,14 @@ class SettingsWindow:
             anchor="w", justify="left",
         ).pack(fill="x", padx=12, pady=(2, 6))
 
-        reset_bar = tk.Frame(self.win, bg=COLOR_PANEL_BG)
+        reset_bar = tk.Frame(body, bg=COLOR_PANEL_BG)
         reset_bar.pack(fill="x", padx=14, pady=(4, 2))
         self._flat_button(
             reset_bar, "Reset keys to default", self._reset_keys,
         ).pack(side="left")
 
         # --- Footer ---
-        footer = tk.Frame(self.win, bg=COLOR_PANEL_BG)
+        footer = tk.Frame(body, bg=COLOR_PANEL_BG)
         footer.pack(fill="x", padx=14, pady=(10, 14))
         self._flat_button(
             footer, "Close", self.close,
@@ -1078,6 +1215,17 @@ class SettingsWindow:
         self.overlay.set_opacity(val)
         try:
             self.opacity_pct.config(text=f"{int(val * 100)}%")
+        except tk.TclError:
+            pass
+
+    def _on_scale(self, value: str) -> None:
+        try:
+            val = float(value)
+        except ValueError:
+            return
+        self.overlay.set_ui_scale(val)
+        try:
+            self.scale_pct.config(text=f"{int(round(self.overlay.scale * 100))}%")
         except tk.TclError:
             pass
 
