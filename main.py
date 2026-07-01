@@ -127,6 +127,7 @@ DEFAULT_CONFIG = {
     "double_press_keys": False,   # require a double key-press to start a timer
     "double_press_seconds": 0.5,
     "double_click_mouse": False,  # require a double mouse-click for start/reset
+    "adjust_increment": 5,        # +/- button step for per-champ cooldown (secs)
     "reset_all_key": "",
     "quit_key": "esc",
 }
@@ -170,6 +171,16 @@ class FlashTimer:
         """Stop the timer (no countdown shown)."""
         self._expires_at = None
 
+    def adjust(self, delta: int, floor: int = 0) -> None:
+        """Change this lane's cooldown by `delta` seconds (never below floor).
+
+        Shifts the live countdown too when running, so a mid-cast tweak is
+        reflected immediately without restarting.
+        """
+        self.duration = max(floor, self.duration + delta)
+        if self._expires_at is not None:
+            self._expires_at = max(time.monotonic(), self._expires_at + delta)
+
     @property
     def running(self) -> bool:
         return self._expires_at is not None
@@ -194,6 +205,7 @@ class FlashOverlay:
     GAP_NAME_TIME = 18  # space between the name column and the countdown
     GAP_TIME_ICON = 12  # space between the countdown and the reset icon
     RESET_R = 9         # reset icon (circular arrow) radius
+    ADJ_GAP = 8         # gap between the reset icon and the +/- buttons
     HIT_PAD = 6         # extra padding around the name/reset click hitboxes
     GEAR_R = 8          # settings gear (shown on the Tab hint line) radius
     CLOSE_R = 8         # close (x) icon (shown on the Tab hint line) radius
@@ -205,7 +217,7 @@ class FlashOverlay:
     # Metrics multiplied by the UI scale factor.
     _SCALED_METRICS = (
         "PAD_X", "PAD_TOP", "PAD_BOTTOM", "ROW_SPACING", "HINT_GAP",
-        "GAP_NAME_TIME", "GAP_TIME_ICON", "RESET_R", "HIT_PAD",
+        "GAP_NAME_TIME", "GAP_TIME_ICON", "RESET_R", "ADJ_GAP", "HIT_PAD",
         "GEAR_R", "CLOSE_R",
     )
 
@@ -244,6 +256,8 @@ class FlashOverlay:
         # Require two presses within this window to confirm a Flash was cast.
         self.double_press_window = float(config.get("double_press_seconds", 0.5))
         self._last_press: dict[str, float] = {}
+        # Per-lane cooldown +/- step (seconds), chosen in 5s intervals.
+        self.adjust_increment = max(5, int(config.get("adjust_increment", 5)))
 
         self._tab_held = False  # show key hints only while Tab is held
         self._hover: tuple[str, str] | None = None  # (kind, role) under the pointer
@@ -251,6 +265,10 @@ class FlashOverlay:
         self._drag_active = False  # dragging the overlay (only while Tab is held)
         self._name_boxes: dict[str, tuple[float, float, float, float]] = {}
         self._reset_boxes: dict[str, tuple[float, float, float, float]] = {}
+        self._plus_boxes: dict[str, tuple[float, float, float, float]] = {}
+        self._minus_boxes: dict[str, tuple[float, float, float, float]] = {}
+        self._adj_hover: tuple[str, str] | None = None  # (kind, role) +/- hover
+        self._preview_until: dict[str, float] = {}  # transient cooldown preview
         self._gear_box = (0.0, 0.0, 0.0, 0.0)
         self._close_box = (0.0, 0.0, 0.0, 0.0)
         self.catcher: "tk.Toplevel | None" = None  # Windows click-catcher window
@@ -415,6 +433,29 @@ class FlashOverlay:
             fill=COLOR_NAME, outline="", tags=(tag, fg_tag),
         )
 
+    @staticmethod
+    def _adj_tags(lane: str, kind: str) -> tuple[str, str]:
+        """Canvas tags for a lane's +/- button: (delete tag, colour tag)."""
+        safe = lane.replace(" ", "_")
+        return f"{kind}-{safe}", f"{kind}fg-{safe}"
+
+    def _draw_adjust(self, cx: float, cy: float, lane: str, kind: str) -> None:
+        """Draw a +/- cooldown button (Tab-only), styled like the reset icon."""
+        del_tag, fg_tag = self._adj_tags(lane, kind)
+        self.canvas.delete(del_tag)
+        vis = "normal" if self._tab_held else "hidden"
+        arm = self.RESET_R * 0.7
+        tags = ("adj", del_tag, fg_tag)
+        self.canvas.create_line(
+            cx - arm, cy, cx + arm, cy, fill=COLOR_NAME, width=2,
+            capstyle="round", state=vis, tags=tags,
+        )
+        if kind == "plus":
+            self.canvas.create_line(
+                cx, cy - arm, cx, cy + arm, fill=COLOR_NAME, width=2,
+                capstyle="round", state=vis, tags=tags,
+            )
+
     # ----- Settings gear ---------------------------------------------------
 
     def _hint_text(self) -> str:
@@ -513,6 +554,14 @@ class FlashOverlay:
     def _render_row(self, lane: str, blink_on: bool = True) -> None:
         """Update one lane's countdown text and colour."""
         timer = self.timers[lane]
+        # Just after a +/- tweak on an idle lane, briefly show the new total
+        # cooldown so the change is visible even with no countdown running.
+        if not timer.running and self._preview_until.get(lane, 0.0) > time.monotonic():
+            self.canvas.itemconfig(
+                self.time_items[lane],
+                text=self._format_duration(timer.duration), fill=COLOR_HINT,
+            )
+            return
         value = self._format(timer.remaining, timer.running)
         if timer.running and timer.remaining <= 0:
             color = COLOR_RED if blink_on else COLOR_EXPIRED_DIM  # blink when up
@@ -553,6 +602,18 @@ class FlashOverlay:
             return "close"
         return None
 
+    def _hit_adjust(self, x: float, y: float) -> tuple[str, str] | None:
+        """Return ("plus"/"minus", role) for a +/- button under the pointer."""
+        if not self._tab_held:
+            return None
+        for role, box in self._plus_boxes.items():
+            if self._in_box(x, y, box):
+                return ("plus", role)
+        for role, box in self._minus_boxes.items():
+            if self._in_box(x, y, box):
+                return ("minus", role)
+        return None
+
     def _bind_interaction(self, widget) -> None:
         """Attach the shared mouse handlers to a canvas or catcher window."""
         widget.bind("<Button-1>", self._on_press)
@@ -574,6 +635,7 @@ class FlashOverlay:
     def _on_leave(self, _event: tk.Event) -> None:
         self._set_hover(None)
         self._set_icon_hover(None)
+        self._set_adj_hover(None)
 
     def _on_press(self, event: tk.Event) -> None:
         # Holding Tab turns the whole overlay into a drag handle (plus the
@@ -585,6 +647,11 @@ class FlashOverlay:
                 return
             if icon == "close":
                 self.quit()
+                return
+            adj = self._hit_adjust(event.x, event.y)
+            if adj is not None:
+                kind, role = adj
+                self._adjust(role, self.adjust_increment if kind == "plus" else -self.adjust_increment)
                 return
             self._drag_active = True
             self._drag = {"x": event.x, "y": event.y}
@@ -617,11 +684,16 @@ class FlashOverlay:
         if self._tab_held:
             icon = self._hit_icon(event.x, event.y)
             self._set_icon_hover(icon)
-            if icon is None:
+            adj = self._hit_adjust(event.x, event.y)
+            self._set_adj_hover(adj)
+            if icon is None and adj is None:
                 self._set_hover(None)
                 self._set_cursor("fleur")  # move cursor in drag mode
+            else:
+                self._set_cursor("hand2")
             return
         self._set_icon_hover(None)
+        self._set_adj_hover(None)
         self._set_hover(self._hit_test(event.x, event.y))
 
     def _set_icon_hover(self, icon: str | None) -> None:
@@ -637,6 +709,36 @@ class FlashOverlay:
             self._on_gear_enter()
         elif icon == "close":
             self._on_close_enter()
+
+    def _set_adj_hover(self, target: tuple[str, str] | None) -> None:
+        """Apply/clear the hover brighten for a +/- cooldown button."""
+        if target == self._adj_hover:
+            return
+        if self._adj_hover is not None:
+            kind, role = self._adj_hover
+            _del, fg = self._adj_tags(role, kind)
+            self.canvas.itemconfig(fg, fill=COLOR_NAME)
+        self._adj_hover = target
+        if target is not None:
+            kind, role = target
+            _del, fg = self._adj_tags(role, kind)
+            self.canvas.itemconfig(fg, fill=COLOR_NAME_HOVER)
+
+    def _adjust(self, lane: str, delta: int) -> None:
+        """Nudge a lane's Flash cooldown by `delta` and flash the button."""
+        self.timers[lane].adjust(delta, floor=self.adjust_increment)
+        if not self.timers[lane].running:
+            self._preview_until[lane] = time.monotonic() + 1.2
+        self._render_row(lane)
+        kind = "plus" if delta > 0 else "minus"
+        _del, fg = self._adj_tags(lane, kind)
+        self.canvas.itemconfig(fg, fill=COLOR_START_FLASH)
+        self.root.after(160, lambda l=lane, k=kind: self._end_adj_flash(l, k))
+
+    def _end_adj_flash(self, lane: str, kind: str) -> None:
+        hovered = self._adj_hover == (kind, lane)
+        _del, fg = self._adj_tags(lane, kind)
+        self.canvas.itemconfig(fg, fill=COLOR_NAME_HOVER if hovered else COLOR_NAME)
 
     def _activate(self, hit: tuple[str, str], double: bool) -> None:
         """Run a name/reset action, honouring the double-click-mouse option."""
@@ -715,7 +817,11 @@ class FlashOverlay:
         time_col_w = self.row_font.measure("0:00")
         time_x = self.PAD_X + name_col_w + self.GAP_NAME_TIME
         reset_cx = time_x + time_col_w + self.GAP_TIME_ICON + self.RESET_R
-        content_w = reset_cx + self.RESET_R + self.PAD_X
+        # The +/- cooldown buttons (Tab-only) sit to the right of the reset icon.
+        step = 2 * self.RESET_R + self.ADJ_GAP
+        plus_cx = reset_cx + step
+        minus_cx = plus_cx + step
+        content_w = minus_cx + self.RESET_R + self.PAD_X
         # The hint line also carries the close (x) and settings (gear) icons.
         self.canvas.itemconfig(self.hint_item, text=self._hint_text())
         gear_space = (
@@ -730,6 +836,8 @@ class FlashOverlay:
         pad = self.HIT_PAD
         self._name_boxes.clear()
         self._reset_boxes.clear()
+        self._plus_boxes.clear()
+        self._minus_boxes.clear()
         y = self.PAD_TOP
         for lane in self.timers:
             row_top = y
@@ -737,6 +845,8 @@ class FlashOverlay:
             self.canvas.coords(self.name_items[lane], self.PAD_X, cy)
             self.canvas.coords(self.time_items[lane], time_x, cy)
             self._draw_reset_icon(reset_cx, cy, lane)
+            self._draw_adjust(plus_cx, cy, lane, "plus")
+            self._draw_adjust(minus_cx, cy, lane, "minus")
             # Generous, text-independent hitboxes for name (start) and reset.
             name_box = (
                 self.PAD_X - pad, row_top,
@@ -748,6 +858,14 @@ class FlashOverlay:
             )
             self._name_boxes[lane] = name_box
             self._reset_boxes[lane] = reset_box
+            self._plus_boxes[lane] = (
+                plus_cx - self.RESET_R - pad, row_top,
+                plus_cx + self.RESET_R + pad, row_top + row_h,
+            )
+            self._minus_boxes[lane] = (
+                minus_cx - self.RESET_R - pad, row_top,
+                minus_cx + self.RESET_R + pad, row_top + row_h,
+            )
             # Solid (subtle) plates make the whole hitbox clickable/hoverable.
             self.canvas.coords(self.name_plates[lane], *name_box)
             self.canvas.coords(self.reset_plates[lane], *reset_box)
@@ -794,6 +912,7 @@ class FlashOverlay:
             self.canvas.tag_raise(self.name_items[lane])
             self.canvas.tag_raise(self.time_items[lane])
             self.canvas.tag_raise(self._reset_tags(lane)[0])
+        self.canvas.tag_raise("adj")  # +/- buttons above plates and reset icons
 
     # ----- Windows click-catcher ------------------------------------------
 
@@ -937,7 +1056,11 @@ class FlashOverlay:
             self.canvas.itemconfig(self.hint_item, state=state)
             self.canvas.itemconfig("gear", state=state)
             self.canvas.itemconfig("close", state=state)
+            self.canvas.itemconfig("adj", state=state)  # +/- cooldown buttons
             self.canvas.itemconfig(self.tab_bg_item, state=state)
+            if not self._tab_held:  # dropped Tab: clear any lingering hovers
+                self._set_icon_hover(None)
+                self._set_adj_hover(None)
             # Tab toggles the catcher between hitbox-only and whole-window so the
             # overlay can be dragged from anywhere while Tab is held.
             self._sync_catcher()
@@ -966,6 +1089,12 @@ class FlashOverlay:
         for timer in self.timers.values():
             timer.duration = self.duration
         self.config["flash_seconds"] = self.duration
+        save_config(self.config)
+
+    def set_adjust_increment(self, seconds: int) -> None:
+        """Set the +/- cooldown step (kept to whole 5-second intervals)."""
+        self.adjust_increment = max(5, int(round(seconds / 5)) * 5)
+        self.config["adjust_increment"] = self.adjust_increment
         save_config(self.config)
 
     def set_ui_scale(self, value: float) -> None:
@@ -1082,6 +1211,11 @@ class FlashOverlay:
             return "UP"
         minutes, seconds = divmod(int(remaining + 0.999), 60)
         return f"{minutes}:{seconds:02d}"
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        minutes, secs = divmod(int(seconds), 60)
+        return f"{minutes}:{secs:02d}"
 
     def _tick(self) -> None:
         """Refresh every countdown once per second (keeps CPU near idle)."""
@@ -1293,6 +1427,22 @@ class SettingsWindow:
         spin.bind("<Return>", lambda _e: self._on_flash())
         spin.bind("<FocusOut>", lambda _e: self._on_flash())
 
+        step_row = tk.Frame(card, bg=COLOR_PANEL_CARD)
+        step_row.pack(fill="x", padx=12, pady=6)
+        self._row_label(step_row, "Cooldown step (s)").pack(side="left")
+        self.step_var = tk.IntVar(value=int(ov.adjust_increment))
+        step_spin = tk.Spinbox(
+            step_row, from_=5, to=120, increment=5, width=6,
+            textvariable=self.step_var, command=self._on_step,
+            bg=COLOR_FIELD_BG, fg=COLOR_PANEL_FG, buttonbackground=COLOR_FIELD_BG,
+            insertbackground=COLOR_PANEL_FG, font=("Consolas", 10), bd=0,
+            highlightthickness=1, highlightbackground=COLOR_FIELD_ACTIVE,
+            justify="right",
+        )
+        step_spin.pack(side="right")
+        step_spin.bind("<Return>", lambda _e: self._on_step())
+        step_spin.bind("<FocusOut>", lambda _e: self._on_step())
+
         op_row = tk.Frame(card, bg=COLOR_PANEL_CARD)
         op_row.pack(fill="x", padx=12, pady=(0, 2))
         self._row_label(op_row, "Opacity").pack(side="left")
@@ -1386,6 +1536,14 @@ class SettingsWindow:
             return
         value = max(1, value)
         self.overlay.set_flash_seconds(value)
+
+    def _on_step(self) -> None:
+        try:
+            value = int(self.step_var.get())
+        except (tk.TclError, ValueError):
+            return
+        self.overlay.set_adjust_increment(value)
+        self.step_var.set(self.overlay.adjust_increment)
 
     def _on_opacity(self, value: str) -> None:
         try:
