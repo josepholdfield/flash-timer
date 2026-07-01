@@ -26,6 +26,11 @@ except ImportError:  # pragma: no cover - friendly hint if dependency missing
 
 from league import ChampionWatcher
 
+try:
+    import winlayer  # Windows per-pixel-alpha click-catcher (see winlayer.py)
+except Exception:  # pragma: no cover - never fatal
+    winlayer = None
+
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -50,10 +55,11 @@ COLOR_ICON_BG_HOVER = "#2a3140"
 
 # Invisible click-catching fill. On Windows the CHROMA colour is rendered fully
 # transparent *and click-through*, so genuinely transparent pixels can't receive
-# clicks. A colour one level off the key stays opaque (clicks land instead of
-# passing through to the game) while being visually indistinguishable from the
-# transparent background. Used for the name/reset hitboxes and the drag surface.
-COLOR_GHOST = "#010102"
+# clicks. Rather than paint a visible plate, the app layers a per-pixel-alpha
+# "click-catcher" window on top (see winlayer.py / FlashOverlay._setup_catcher),
+# so the name/reset backgrounds can stay completely transparent while remaining
+# clickable. On platforms without the colour key (macOS dev), the -alpha window
+# already receives clicks everywhere, so nothing extra is needed either.
 
 # Settings panel palette (kept in keeping with the overlay's dark styling).
 COLOR_PANEL_BG = "#12141b"
@@ -241,9 +247,14 @@ class FlashOverlay:
 
         self._tab_held = False  # show key hints only while Tab is held
         self._hover: tuple[str, str] | None = None  # (kind, role) under the pointer
+        self._icon_hover: str | None = None  # "gear"/"close" under the pointer
         self._drag_active = False  # dragging the overlay (only while Tab is held)
         self._name_boxes: dict[str, tuple[float, float, float, float]] = {}
         self._reset_boxes: dict[str, tuple[float, float, float, float]] = {}
+        self._gear_box = (0.0, 0.0, 0.0, 0.0)
+        self._close_box = (0.0, 0.0, 0.0, 0.0)
+        self.catcher: "tk.Toplevel | None" = None  # Windows click-catcher window
+        self._catcher_hwnd = 0
         self._win_w = 0
         self._win_h = 0
         self._grad_img: tk.PhotoImage | None = None
@@ -275,13 +286,15 @@ class FlashOverlay:
             except tk.TclError:
                 pass
 
-        # Fill used for invisible click-catching zones. Only needed with the
-        # colour-key (Windows), where transparent pixels are click-through; with
-        # -alpha every pixel already receives clicks, so no fill is required.
-        self._ghost = COLOR_GHOST if self._use_chroma else ""
+        # Name/reset backgrounds stay fully transparent (empty fill). Clicks in
+        # those transparent areas are caught by the Windows click-catcher window
+        # (or, on other platforms, by the -alpha window which is never
+        # click-through). See _setup_catcher.
+        self._ghost = ""
 
         self._build_ui()
         self._place_window()
+        self._setup_catcher()
         self._register_hotkeys()
         self._watch_tab()
 
@@ -364,18 +377,11 @@ class FlashOverlay:
             0, 0, anchor="nw", text=self._hint_text(), font=self.hint_font,
             fill=COLOR_HINT, state="hidden",
         )
-        # Settings gear lives on the hint line and is only shown while Tab is
-        # held (drawn/positioned in _relayout).
-        self._gear_bound = False
-        self._close_bound = False
 
-        # Canvas-level interaction: name/reset hitboxes and Tab-to-drag.
-        self.canvas.bind("<Button-1>", self._on_press)
-        self.canvas.bind("<Double-Button-1>", self._on_double_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Motion>", self._on_motion)
-        self.canvas.bind("<Leave>", lambda _e: self._set_hover(None))
+        # Canvas-level interaction: name/reset hitboxes and Tab-to-drag. On
+        # Windows these also fire on the transparent click-catcher window (bound
+        # in _setup_catcher); coordinates match since it mirrors this window.
+        self._bind_interaction(self.canvas)
 
         self._relayout()
 
@@ -455,21 +461,15 @@ class FlashOverlay:
             tags=("gear", "gear-bg"),
         )
 
-        if not self._gear_bound:
-            self.canvas.tag_bind("gear", "<Button-1>", lambda _e: self._open_settings())
-            self.canvas.tag_bind("gear", "<Enter>", lambda _e: self._on_gear_enter())
-            self.canvas.tag_bind("gear", "<Leave>", lambda _e: self._on_gear_leave())
-            self._gear_bound = True
-
     def _on_gear_enter(self) -> None:
         self.canvas.itemconfig("gear-bg", fill=COLOR_ICON_BG_HOVER)
         self.canvas.itemconfig("gear-fg", fill=COLOR_ICON_HOVER)
-        self.canvas.configure(cursor="hand2")
+        self._set_cursor("hand2")
 
     def _on_gear_leave(self) -> None:
         self.canvas.itemconfig("gear-bg", fill=COLOR_ICON_BG)
         self.canvas.itemconfig("gear-fg", fill=COLOR_ICON)
-        self.canvas.configure(cursor="")
+        self._set_cursor("")
 
     def _open_settings(self) -> None:
         """Open (or focus) the settings window."""
@@ -500,21 +500,15 @@ class FlashOverlay:
             capstyle="round", state=vis, tags=("close", "close-fg"),
         )
 
-        if not self._close_bound:
-            self.canvas.tag_bind("close", "<Button-1>", lambda _e: self.quit())
-            self.canvas.tag_bind("close", "<Enter>", lambda _e: self._on_close_enter())
-            self.canvas.tag_bind("close", "<Leave>", lambda _e: self._on_close_leave())
-            self._close_bound = True
-
     def _on_close_enter(self) -> None:
         self.canvas.itemconfig("close-bg", fill=COLOR_ICON_BG_HOVER)
         self.canvas.itemconfig("close-fg", fill=COLOR_RED)
-        self.canvas.configure(cursor="hand2")
+        self._set_cursor("hand2")
 
     def _on_close_leave(self) -> None:
         self.canvas.itemconfig("close-bg", fill=COLOR_ICON_BG)
         self.canvas.itemconfig("close-fg", fill=COLOR_ICON)
-        self.canvas.configure(cursor="")
+        self._set_cursor("")
 
     def _render_row(self, lane: str, blink_on: bool = True) -> None:
         """Update one lane's countdown text and colour."""
@@ -549,9 +543,49 @@ class FlashOverlay:
                 return ("name", role)
         return None
 
+    def _hit_icon(self, x: float, y: float) -> str | None:
+        """Return "gear"/"close" if the pointer is over that icon (Tab only)."""
+        if not self._tab_held:
+            return None
+        if self._in_box(x, y, self._gear_box):
+            return "gear"
+        if self._in_box(x, y, self._close_box):
+            return "close"
+        return None
+
+    def _bind_interaction(self, widget) -> None:
+        """Attach the shared mouse handlers to a canvas or catcher window."""
+        widget.bind("<Button-1>", self._on_press)
+        widget.bind("<Double-Button-1>", self._on_double_press)
+        widget.bind("<B1-Motion>", self._on_drag)
+        widget.bind("<ButtonRelease-1>", self._on_release)
+        widget.bind("<Motion>", self._on_motion)
+        widget.bind("<Leave>", self._on_leave)
+
+    def _set_cursor(self, cursor: str) -> None:
+        """Set the pointer on whichever surface(s) receive events."""
+        for target in (self.canvas, self.catcher):
+            if target is not None:
+                try:
+                    target.configure(cursor=cursor)
+                except tk.TclError:
+                    pass
+
+    def _on_leave(self, _event: tk.Event) -> None:
+        self._set_hover(None)
+        self._set_icon_hover(None)
+
     def _on_press(self, event: tk.Event) -> None:
-        # Holding Tab turns the whole overlay into a drag handle.
+        # Holding Tab turns the whole overlay into a drag handle (plus the
+        # gear/close icons on the hint line stay clickable).
         if self._tab_held:
+            icon = self._hit_icon(event.x, event.y)
+            if icon == "gear":
+                self._open_settings()
+                return
+            if icon == "close":
+                self.quit()
+                return
             self._drag_active = True
             self._drag = {"x": event.x, "y": event.y}
             return
@@ -572,6 +606,7 @@ class FlashOverlay:
         x = self.root.winfo_x() + event.x - self._drag["x"]
         y = self.root.winfo_y() + event.y - self._drag["y"]
         self.root.geometry(f"+{x}+{y}")
+        self._sync_catcher()  # keep the click-catcher aligned while dragging
 
     def _on_release(self, _event: tk.Event) -> None:
         self._drag_active = False
@@ -580,10 +615,28 @@ class FlashOverlay:
         if self._drag_active:
             return
         if self._tab_held:
-            self._set_hover(None)
-            self.canvas.configure(cursor="fleur")  # move cursor in drag mode
+            icon = self._hit_icon(event.x, event.y)
+            self._set_icon_hover(icon)
+            if icon is None:
+                self._set_hover(None)
+                self._set_cursor("fleur")  # move cursor in drag mode
             return
+        self._set_icon_hover(None)
         self._set_hover(self._hit_test(event.x, event.y))
+
+    def _set_icon_hover(self, icon: str | None) -> None:
+        """Apply/clear the hover effect for the gear/close hint-line icons."""
+        if icon == self._icon_hover:
+            return
+        if self._icon_hover == "gear":
+            self._on_gear_leave()
+        elif self._icon_hover == "close":
+            self._on_close_leave()
+        self._icon_hover = icon
+        if icon == "gear":
+            self._on_gear_enter()
+        elif icon == "close":
+            self._on_close_enter()
 
     def _activate(self, hit: tuple[str, str], double: bool) -> None:
         """Run a name/reset action, honouring the double-click-mouse option."""
@@ -637,7 +690,7 @@ class FlashOverlay:
         self._hover = hit
         # Apply the new hover.
         if hit is None:
-            self.canvas.configure(cursor="")
+            self._set_cursor("")
             return
         kind, role = hit
         if kind == "name":
@@ -645,7 +698,7 @@ class FlashOverlay:
         elif kind == "reset":
             _tag, fg_tag = self._reset_tags(role)
             self.canvas.itemconfig(fg_tag, fill=COLOR_NAME_HOVER, outline=COLOR_NAME_HOVER)
-        self.canvas.configure(cursor="hand2")
+        self._set_cursor("hand2")
 
     def _relayout(self) -> None:
         """Recompute size/positions, redraw reset icons and the gradient."""
@@ -708,6 +761,16 @@ class FlashOverlay:
         self._draw_gear(gear_cx, icon_cy)
         close_cx = gear_cx - self.GEAR_R - 8 - self.CLOSE_R
         self._draw_close(close_cx, icon_cy)
+        # Coordinate hitboxes for the hint-line icons (used for hover/click,
+        # since they no longer carry per-item bindings).
+        self._gear_box = (
+            gear_cx - self.GEAR_R - pad, icon_cy - self.GEAR_R - pad,
+            gear_cx + self.GEAR_R + pad, icon_cy + self.GEAR_R + pad,
+        )
+        self._close_box = (
+            close_cx - self.CLOSE_R - pad, icon_cy - self.CLOSE_R - pad,
+            close_cx + self.CLOSE_R + pad, icon_cy + self.CLOSE_R + pad,
+        )
         y += hint_h
         height = y + self.PAD_BOTTOM
 
@@ -719,6 +782,7 @@ class FlashOverlay:
         self.canvas.coords(self.tab_bg_item, 0, 0, width, height)
         self._draw_gradient(width, height)
         self._restack()
+        self._sync_catcher()
 
     def _restack(self) -> None:
         """Keep z-order: gradient < drag surface < plates < text/icons < hints."""
@@ -730,6 +794,53 @@ class FlashOverlay:
             self.canvas.tag_raise(self.name_items[lane])
             self.canvas.tag_raise(self.time_items[lane])
             self.canvas.tag_raise(self._reset_tags(lane)[0])
+
+    # ----- Windows click-catcher ------------------------------------------
+
+    def _setup_catcher(self) -> None:
+        """Create the invisible per-pixel-alpha window that catches clicks.
+
+        Only used on Windows, where colour-key transparent pixels are otherwise
+        click-through. Elsewhere the -alpha window already receives clicks and
+        this is skipped.
+        """
+        if winlayer is None or not winlayer.available() or not self._use_chroma:
+            return
+        try:
+            catcher = tk.Toplevel(self.root)
+            catcher.overrideredirect(True)
+            catcher.attributes("-topmost", bool(self.config["always_on_top"]))
+            catcher.geometry(
+                f"{self._win_w}x{self._win_h}"
+                f"+{self.root.winfo_x()}+{self.root.winfo_y()}"
+            )
+            catcher.update_idletasks()
+            hwnd = winlayer.toplevel_hwnd(catcher)
+            winlayer.make_layered(hwnd)
+            self.catcher = catcher
+            self._catcher_hwnd = hwnd
+            self._bind_interaction(catcher)
+            self._sync_catcher()
+        except Exception as exc:  # pragma: no cover - defensive on odd setups
+            print(f"[flash-timer] click-catcher unavailable: {exc}")
+            self.catcher = None
+
+    def _sync_catcher(self) -> None:
+        """Align the click-catcher to the overlay and refresh its click mask."""
+        if self.catcher is None:
+            return
+        w, h = self._win_w, self._win_h
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        self.catcher.geometry(f"{w}x{h}+{x}+{y}")
+        if self._tab_held:
+            # Drag/interact anywhere while Tab is held.
+            rects = [(0, 0, w, h)]
+        else:
+            rects = list(self._name_boxes.values()) + list(self._reset_boxes.values())
+        try:
+            winlayer.update_layered(self._catcher_hwnd, x, y, w, h, rects)
+        except Exception:
+            pass
 
     def _draw_gradient(self, w: int, h: int) -> None:
         """Render the diagonal black gradient (darkest at the bottom-left).
@@ -827,6 +938,9 @@ class FlashOverlay:
             self.canvas.itemconfig("gear", state=state)
             self.canvas.itemconfig("close", state=state)
             self.canvas.itemconfig(self.tab_bg_item, state=state)
+            # Tab toggles the catcher between hitbox-only and whole-window so the
+            # overlay can be dragged from anywhere while Tab is held.
+            self._sync_catcher()
         self.root.after(120, self._poll_hint)
 
     def _start_lane(self, lane: str) -> None:
@@ -1004,6 +1118,11 @@ class FlashOverlay:
         if self.watcher is not None:
             self.watcher.stop()
         keyboard.unhook_all()
+        if self.catcher is not None:
+            try:
+                self.catcher.destroy()
+            except tk.TclError:
+                pass
         self.root.destroy()
 
     def run(self) -> None:
